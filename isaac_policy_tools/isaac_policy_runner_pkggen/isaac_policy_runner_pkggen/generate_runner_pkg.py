@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 from pathlib import Path
@@ -44,11 +45,26 @@ def _render_package_xml(pkg: str) -> str:
 
 
 def _render_setup_py(pkg: str) -> str:
-    # NOTE: We intentionally do NOT install bundle content here.
-    # Bundle placement is handled by isaac_policy_export (separate command).
     return f'''from setuptools import setup
+import os
 
 package_name = "{pkg}"
+
+
+def _bundle_data_files():
+    data_files = []
+    src_root = os.path.join(os.path.dirname(__file__), "bundle")
+    if not os.path.isdir(src_root):
+        return data_files
+
+    for root, _, files in os.walk(src_root):
+        rel_dir = os.path.relpath(root, os.path.dirname(__file__))  # bundle/<policy_name>/...
+        install_dir = os.path.join("share", package_name, rel_dir)
+        paths = [os.path.join(root, f) for f in files]
+        if paths:
+            data_files.append((install_dir, paths))
+    return data_files
+
 
 setup(
     name=package_name,
@@ -58,7 +74,7 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/launch", ["launch/isaac_policy_runner.launch.py"]),
-        # We keep an empty bundle/ directory in source tree as a convention.
+        *_bundle_data_files(),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -132,10 +148,9 @@ def main(argv: list[str] | None = None) -> int:
             raise FileExistsError(f"{pkg_dir} exists (use --force)")
         shutil.rmtree(pkg_dir)
 
-    # Create skeleton
     (pkg_dir / pkg).mkdir(parents=True, exist_ok=True)
     (pkg_dir / "launch").mkdir(parents=True, exist_ok=True)
-    (pkg_dir / "bundle").mkdir(parents=True, exist_ok=True)  # placeholder dir
+    (pkg_dir / "bundle").mkdir(parents=True, exist_ok=True)
     (pkg_dir / "resource").mkdir(parents=True, exist_ok=True)
 
     _write_text(pkg_dir / "package.xml", _render_package_xml(pkg))
@@ -147,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[OK] Generated package: {pkg_dir}")
     print(f"Build: colcon build --packages-select {pkg}")
+    print("Note: bundle/** is installed. After adding/updating bundles, rebuild the runner package.")
     print(f"Run:   ros2 launch {pkg} isaac_policy_runner.launch.py policy_name:=<policy_name>")
     return 0
 

@@ -7,7 +7,19 @@ A small utility to generate a robot-specific ROS 2 `ament_python` package:
 The generated package contains:
 
 - `launch/isaac_policy_runner.launch.py`
-- `bundle/` (empty placeholder directory; policy bundles are managed by other tools, e.g. `isaac_policy_export`)
+- `bundle/` (a directory intended to contain one or more policy bundles)
+
+## Why bundle is installed
+
+This generator configures the generated runner package to **install all files under `bundle/**`**
+into:
+
+`share/<robot>_isaac_policy_runner/bundle/**`
+
+This makes runtime lookup via `FindPackageShare(<robot>_isaac_policy_runner)/bundle/<policy_name>`
+work reliably.
+
+> Note: When you add/update bundles under `bundle/`, you must rebuild the runner package with `colcon build`.
 
 ## Install (editable)
 
@@ -19,21 +31,27 @@ pip install -e .
 
 ```bash
 isaac-generate-runner-pkg \
-  --ws_src ~/ros2_humble/src \
+  --ws_src ~/ros2_humble/src/kuroko_ros2 \
   --robot_name kuroko \
   --force
 ```
 
-## Build and run
+## Add a bundle
+
+Place a bundle under:
+
+`<ws>/src/<robot>_isaac_policy_runner/bundle/<policy_name>/...`
+
+Then rebuild:
 
 ```bash
 cd ~/ros2_humble
-colcon build --packages-select kuroko_isaac_policy_runner
+colcon build --packages-select <robot>_isaac_policy_runner
 source install/setup.bash
-
-ros2 launch kuroko_isaac_policy_runner isaac_policy_runner.launch.py policy_name:=kuroko_walk
 ```
 
-`policy_name` selects a bundle directory under:
+## Run
 
-`share/kuroko_isaac_policy_runner/bundle/<policy_name>`
+```bash
+ros2 launch <robot>_isaac_policy_runner isaac_policy_runner.launch.py policy_name:=<policy_name>
+```
