@@ -1,14 +1,9 @@
-
-isaac_policy_tools/isaac_policy_export/isaac_policy_export.egg-info/
-
-isaac_policy_tools/isaac_policy_export/isaac_policy_export/__pycache__/
-
 isaac_policy_tools/isaac_policy_export/build/
-
-isaac_policy_tools/isaac_policy_runner_pkggen/isaac_policy_runner_pkggen.egg-info/
-
-isaac_policy_tools/isaac_policy_runner_pkggen/isaac_policy_runner_pkggen/__pycache__/
 
 isaac_policy_tools/isaac_policy_runner_pkggen/build/
 
-isaac_policy_runtime/isaac_policy_runtime/__pycache__/
+*.pyc
+
+*.egg-info/
+
+*__pycache__/
