@@ -1,0 +1,3 @@
+# Example bringup config. In v1, the runtime reads topics from the bundle's robot_interface.yaml.
+# You can still use bringup-level configs to document robot variants or to feed other nodes.
+robot_name: example

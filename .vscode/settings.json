@@ -1,0 +1,18 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/home/nyx/ros2_humble/build/kuroko_policy",
+        "/home/nyx/ros2_humble/install/kuroko_policy/lib/python3.10/site-packages",
+        "/home/nyx/ros2_humble/build/kuroko_isaac_player",
+        "/home/nyx/ros2_humble/install/kuroko_isaac_player/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/nyx/ros2_humble/build/kuroko_policy",
+        "/home/nyx/ros2_humble/install/kuroko_policy/lib/python3.10/site-packages",
+        "/home/nyx/ros2_humble/build/kuroko_isaac_player",
+        "/home/nyx/ros2_humble/install/kuroko_isaac_player/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ]
+}

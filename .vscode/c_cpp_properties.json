@@ -1,0 +1,30 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${default}",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/home/nyx/ros2_humble/install/kuroko_odom/include/**",
+        "/home/nyx/ros2_humble/install/kuroko_kinematics/include/**",
+        "/home/nyx/ros2_humble/install/kuroko_imu/include/**",
+        "/home/nyx/ros2_humble/install/gz_ros2_pid_control/include/**",
+        "/home/nyx/ros2_humble/install/gz_ros2_control/include/**",
+        "/opt/ros/humble/include/**",
+        "/home/nyx/ros2_humble/src/gz_ros2_control/gz_ros2_control/include/**",
+        "/home/nyx/ros2_humble/src/gz_ros2_control/gz_ros2_pid_control/include/**",
+        "/home/nyx/ros2_humble/src/kuroko_ros2/kuroko_imu/include/**",
+        "/home/nyx/ros2_humble/src/kuroko_ros2/kuroko_kinematics/include/**",
+        "/home/nyx/ros2_humble/src/kuroko_ros2/kuroko_odom/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ROS",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++14"
+    }
+  ],
+  "version": 4
+}

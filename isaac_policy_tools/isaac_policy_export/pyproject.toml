@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "isaac-policy-export"
+version = "0.1.0"
+description = "Exporter for Isaac Lab policy bundles consumed by isaac_policy_runtime."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "pyyaml>=6.0",
+]
+
+[project.scripts]
+isaac-export-bundle = "isaac_policy_export.export_bundle:main"
