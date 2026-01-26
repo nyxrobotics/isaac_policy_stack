@@ -18,6 +18,7 @@ from .terms.base import RuntimeState
 from .terms.registry import get_term_class
 from .control.sinks.ros2_control_topic import Ros2ControlTopicSink
 from .terms.joints import build_joint_maps
+import isaac_policy_runtime.terms  # noqa: F401
 
 try:
     # ROS 2 helper to query remote node parameters (e.g. controller joints order).
