@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["setuptools>=40.8.0", "wheel"]
+build-backend = "setuptools.build_meta:__legacy__"
 
 [project]
 name = "isaac-policy-runner-pkggen"
@@ -8,10 +8,9 @@ version = "0.1.0"
 description = "Generate <robot>_isaac_policy_runner ROS 2 ament_python packages with launch files."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+  "pyyaml>=6.0",
+]
 
 [project.scripts]
 isaac-generate-runner-pkg = "isaac_policy_runner_pkggen.generate_runner_pkg:main"
-
-[tool.setuptools]
-packages = ["isaac_policy_runner_pkggen"]
