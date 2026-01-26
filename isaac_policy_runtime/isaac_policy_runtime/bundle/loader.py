@@ -65,7 +65,7 @@ def load_bundle(bundle_path: str) -> PolicyBundle:
         joint_order=joint_order,
         scale=ac.get("scale"),
         use_default_offset=ac.get("use_default_offset"),
-        clip=tuple(ac.get("clip", [-1.0, 1.0])),
+        clip=tuple(ac.get("clip") or [-1.0, 1.0]),
     )
 
     rif = yaml.safe_load(robot_if_path.read_text(encoding="utf-8"))
