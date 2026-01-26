@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import List
 
 import numpy as np
@@ -18,6 +17,13 @@ from .io.source_manager import SourceManager
 from .terms.base import RuntimeState
 from .terms.registry import get_term_class
 from .control.sinks.ros2_control_topic import Ros2ControlTopicSink
+from .terms.joints import build_joint_maps
+
+try:
+    # ROS 2 helper to query remote node parameters (e.g. controller joints order).
+    from rclpy.parameter_client import AsyncParameterClient
+except Exception:  # pragma: no cover
+    AsyncParameterClient = None
 
 
 class PolicyRunner(Node):
@@ -79,8 +85,15 @@ class PolicyRunner(Node):
         if sink_type != "ros2_control_topic":
             raise ValueError(f"Unsupported control sink '{sink_type}' (v1 supports ros2_control_topic only)")
 
-        topic = str(ctrl.get("topic", "/joint_group_pos_controller/commands"))
+        # Newer bundles: command_topic / controller_name (+ runtime joint order resolution via ROS params)
+        # Backwards-compatible bundles: topic
+        topic = str(ctrl.get("command_topic", ctrl.get("topic", "/joint_group_position_controller/commands")))
         self.sink = Ros2ControlTopicSink(node=self, topic=topic)
+
+        # Resolve controller joint order at runtime (optional but recommended)
+        self._cmd_joint_order_ros: list[str] | None = None
+        self._cmd_to_policy_idx: np.ndarray | None = None
+        self._resolve_command_joint_order_and_map()
 
         self.rate_hz = float(ctrl.get("rate_hz", 200.0))
         self.decimation = int(ctrl.get("decimation", 4))
@@ -88,9 +101,17 @@ class PolicyRunner(Node):
 
         if self.log_io:
             self.get_logger().info(f"Bundle: {self.bundle.root}")
-            self.get_logger().info(f"Observations terms ({len(self.bundle.observations)}): {[o.name for o in self.bundle.observations]}")
-            self.get_logger().info(f"Action joints ({len(self.bundle.action_config.joint_order)}): {self.bundle.action_config.joint_order}")
+            self.get_logger().info(
+                f"Observations terms ({len(self.bundle.observations)}): {[o.name for o in self.bundle.observations]}"
+            )
+            self.get_logger().info(
+                f"Action joints ({len(self.bundle.action_config.joint_order)}): {self.bundle.action_config.joint_order}"
+            )
             self.get_logger().info(f"Control topic: {topic} @ rate_hz={self.rate_hz}, decimation={self.decimation}")
+            if self._cmd_joint_order_ros is not None:
+                self.get_logger().info(
+                    f"Controller joints resolved via ROS params ({len(self._cmd_joint_order_ros)}): {self._cmd_joint_order_ros}"
+                )
 
         period = 1.0 / self.rate_hz
         self.timer = self.create_timer(period, self._step)
@@ -104,7 +125,6 @@ class PolicyRunner(Node):
         for t in self.terms:
             part = t.compute()
             part = np.asarray(part, dtype=np.float32).reshape(-1)
-            # optional clip per term
             clip = t.obs_spec.clip
             if clip is not None:
                 part = np.clip(part, clip[0], clip[1])
@@ -117,18 +137,13 @@ class PolicyRunner(Node):
                 raise RuntimeError(f"Obs shape {obs.shape} != normalization mean shape {self.obs_mean.shape}")
             obs = (obs - self.obs_mean) / (self.obs_std + 1e-6)
 
-        # ONNX inference expects batch dimension
         inp = obs.reshape(1, -1)
         out = self.sess.run([self.output_name], {self.input_name: inp})[0]
         action = np.asarray(out, dtype=np.float32).reshape(-1)
 
-        # store last action (policy output)
         self.state.last_action = action.copy()
 
-        # Decode joint position targets
         q_target = self._decode_joint_position(action)
-
-        # Publish
         self.sink.publish_positions(q_target)
 
     def _decode_joint_position(self, action: np.ndarray) -> np.ndarray:
@@ -141,11 +156,111 @@ class PolicyRunner(Node):
 
         if bool(cfg.use_default_offset):
             defaults = dict((self.bundle.robot_interface.joints or {}).get("default_pos", {}) or {})
-            # default_pos is keyed by policy joint names
             offset = np.asarray([float(defaults.get(j, 0.0)) for j in cfg.joint_order], dtype=np.float32)
             q = q + offset
 
-        return q.astype(np.float32, copy=False)
+        q_policy = q.astype(np.float32, copy=False)
+
+        # Remap policy joint order -> controller command joint order (resolved at runtime).
+        if self._cmd_to_policy_idx is None:
+            # No controller mapping available: publish in policy order (legacy behavior).
+            return q_policy
+
+        q_cmd = np.zeros((int(self._cmd_to_policy_idx.shape[0]),), dtype=np.float32)
+        for i, pol_idx in enumerate(self._cmd_to_policy_idx.tolist()):
+            if pol_idx >= 0:
+                q_cmd[i] = float(q_policy[int(pol_idx)])
+            else:
+                # Controller joint not part of policy DOFs (e.g., unactuated). Keep zero.
+                q_cmd[i] = 0.0
+        return q_cmd
+
+    def _resolve_command_joint_order_and_map(self) -> None:
+        """Resolve controller command joint order and build an index map into policy joint order.
+
+        Runtime behavior:
+          - Query: ros2 param get <controller_name> joints
+          - Map: controller_ros_joint -> policy_joint_index
+
+        We DO NOT put controller joint order into the bundle.
+        """
+        ctrl = self.bundle.robot_interface.control
+        controller_name = str(ctrl.get("controller_name", ""))
+
+        resolution = dict(ctrl.get("command_joint_order_resolution", {}) or {})
+        param_name = str(resolution.get("param", "joints"))
+        node_name = str(resolution.get("node", controller_name))
+
+        if not node_name:
+            return
+        if AsyncParameterClient is None:
+            self.get_logger().warning(
+                "AsyncParameterClient is unavailable. Skipping controller joint order resolution; publishing in policy order."
+            )
+            return
+
+        client = AsyncParameterClient(self, node_name)
+        if not client.wait_for_services(timeout_sec=2.0):
+            self.get_logger().warning(
+                f"Parameter services not available for node '{node_name}'. Publishing in policy order."
+            )
+            return
+
+        fut = client.get_parameters([param_name])
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=2.0)
+        if fut.result() is None:
+            self.get_logger().warning(
+                f"Failed to read param '{param_name}' from node '{node_name}'. Publishing in policy order."
+            )
+            return
+
+        params = fut.result()
+        if not params or len(params) != 1:
+            self.get_logger().warning(
+                f"Unexpected response reading param '{param_name}' from node '{node_name}'. Publishing in policy order."
+            )
+            return
+
+        p = params[0]
+        joints_ros = None
+        try:
+            joints_ros = list(p.string_array_value)
+        except Exception:
+            try:
+                joints_ros = list(getattr(p, "value"))
+            except Exception:
+                joints_ros = None
+
+        if not joints_ros:
+            self.get_logger().warning(
+                f"Param '{param_name}' from '{node_name}' is empty or not a string array. Publishing in policy order."
+            )
+            return
+
+        self._cmd_joint_order_ros = [str(x) for x in joints_ros]
+
+        # Build ROS->policy map (optional). If missing, identity is used.
+        ros_to_policy, _ = build_joint_maps(self.bundle.robot_interface.joints or {})
+        policy_order = list(self.bundle.action_config.joint_order)
+        pol_index = {name: i for i, name in enumerate(policy_order)}
+
+        idx = []
+        missing = []
+        for rn in self._cmd_joint_order_ros:
+            pn = ros_to_policy.get(rn, rn)
+            if pn in pol_index:
+                idx.append(int(pol_index[pn]))
+            else:
+                idx.append(-1)
+                missing.append({"ros": rn, "policy": pn})
+
+        if missing and self.strict:
+            raise RuntimeError(
+                "Controller joint list contains joints not present in policy_joint_order: "
+                + ", ".join([f\"{m['ros']}-> {m['policy']}\" for m in missing])
+            )
+
+        self._cmd_to_policy_idx = np.asarray(idx, dtype=np.int32)
 
 
 def main():

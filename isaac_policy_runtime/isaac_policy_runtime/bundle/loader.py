@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import yaml
 
 from .schema import ActionConfig, ObservationSpec, RobotInterface, SourceSpec
+
 
 @dataclass(frozen=True)
 class PolicyBundle:
@@ -21,14 +21,21 @@ class PolicyBundle:
     obs_normalization: Dict[str, Any] | None
     metadata: Dict[str, Any] | None
 
+
 def _require(path: Path) -> None:
     if not path.exists():
         raise FileNotFoundError(str(path))
 
+
 def load_bundle(bundle_path: str) -> PolicyBundle:
     root = Path(bundle_path).expanduser().resolve()
 
-    policy_onnx = root / "policy.onnx"
+    # Preferred layout: bundle/exported/policy.onnx
+    # Backwards-compatible layout: bundle/policy.onnx
+    policy_onnx = root / "exported" / "policy.onnx"
+    if not policy_onnx.exists():
+        policy_onnx = root / "policy.onnx"
+
     io_desc_path = root / "io_descriptor.json"
     action_cfg_path = root / "action_config.json"
     robot_if_path = root / "robot_interface.yaml"
@@ -51,9 +58,11 @@ def load_bundle(bundle_path: str) -> PolicyBundle:
         )
 
     ac = json.loads(action_cfg_path.read_text(encoding="utf-8"))
+    # Newer bundles may use 'policy_joint_order' to avoid ambiguity.
+    joint_order = list(ac.get("policy_joint_order") or ac.get("joint_order") or [])
     action_config = ActionConfig(
         type=ac.get("type", "joint_position"),
-        joint_order=list(ac.get("joint_order", [])),
+        joint_order=joint_order,
         scale=ac.get("scale"),
         use_default_offset=ac.get("use_default_offset"),
         clip=tuple(ac.get("clip", [-1.0, 1.0])),
@@ -65,6 +74,7 @@ def load_bundle(bundle_path: str) -> PolicyBundle:
     sources: dict[str, SourceSpec] = {}
     for k, v in dict(rif.get("sources", {})).items():
         sources[str(k)] = SourceSpec(msg_type=str(v["msg_type"]), topic=str(v["topic"]))
+
     robot_interface = RobotInterface(
         version=version,
         frames=frames,
