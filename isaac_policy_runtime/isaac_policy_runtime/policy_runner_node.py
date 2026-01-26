@@ -257,7 +257,7 @@ class PolicyRunner(Node):
         if missing and self.strict:
             raise RuntimeError(
                 "Controller joint list contains joints not present in policy_joint_order: "
-                + ", ".join([f\"{m['ros']}-> {m['policy']}\" for m in missing])
+                + ", ".join([f"{m['ros']}-> {m['policy']}" for m in missing])
             )
 
         self._cmd_to_policy_idx = np.asarray(idx, dtype=np.int32)
