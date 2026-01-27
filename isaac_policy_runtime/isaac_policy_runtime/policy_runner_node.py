@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from typing import List
+from typing import Optional
 
 import numpy as np
 import rclpy
@@ -22,16 +23,10 @@ import isaac_policy_runtime.terms  # noqa: F401
 
 # ROS 2 helper to query remote node parameters (e.g. controller joints order).
 # Depending on distro, the class name may vary. We support both.
-AsyncParameterClient = None
 try:  # pragma: no cover
-    from rclpy.parameter_client import AsyncParameterClient as _APC  # type: ignore
-    AsyncParameterClient = _APC
+    from rcl_interfaces.srv import GetParameters
 except Exception:  # pragma: no cover
-    try:
-        from rclpy.parameter_client import AsyncParametersClient as _APCs  # type: ignore
-        AsyncParameterClient = _APCs
-    except Exception:
-        AsyncParameterClient = None
+    GetParameters = None
 
 
 class PolicyRunner(Node):
@@ -180,7 +175,7 @@ class PolicyRunner(Node):
         if self._cmd_to_policy_idx is None:
             # No controller mapping available: publish in policy order (legacy behavior).
             return q_policy
-
+        
         q_cmd = np.zeros((int(self._cmd_to_policy_idx.shape[0]),), dtype=np.float32)
         for i, pol_idx in enumerate(self._cmd_to_policy_idx.tolist()):
             if pol_idx >= 0:
@@ -189,6 +184,39 @@ class PolicyRunner(Node):
                 # Controller joint not part of policy DOFs (e.g., unactuated). Keep zero.
                 q_cmd[i] = 0.0
         return q_cmd
+
+    def _get_remote_string_array_param(
+        self, node_name: str, param_name: str, timeout_sec: float = 2.0
+    ) -> Optional[list[str]]:
+        """Read a remote string-array parameter via the standard get_parameters service.
+
+        Works even when rclpy.parameter_client.AsyncParametersClient is unavailable.
+        """
+        if GetParameters is None:
+            return None
+
+        base = node_name if node_name.startswith("/") else f"/{node_name}"
+        srv_name = f"{base}/get_parameters"
+
+        client = self.create_client(GetParameters, srv_name)
+        if not client.wait_for_service(timeout_sec=timeout_sec):
+            return None
+
+        req = GetParameters.Request()
+        req.names = [param_name]
+
+        fut = client.call_async(req)
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=timeout_sec)
+        resp = fut.result()
+        if resp is None or not getattr(resp, "values", None) or len(resp.values) != 1:
+            return None
+
+        v = resp.values[0]
+        arr = list(getattr(v, "string_array_value", []) or [])
+        if not arr:
+            return None
+        return [str(x) for x in arr]
+    
 
     def _resolve_command_joint_order_and_map(self) -> None:
         """Resolve controller command joint order and build an index map into policy joint order.
@@ -208,55 +236,15 @@ class PolicyRunner(Node):
 
         if not node_name:
             return
-        if AsyncParameterClient is None:
-            self.get_logger().warning(
-                "AsyncParameterClient is unavailable. Skipping controller joint order resolution; publishing in policy order."
-            )
-            return
-
-        client = AsyncParameterClient(self, node_name)
-
-        # rclpy provides wait_for_services()/services_are_ready() depending on version.
-        ok = False
-        if hasattr(client, "wait_for_services"):
-            ok = bool(client.wait_for_services(timeout_sec=2.0))
-        elif hasattr(client, "services_are_ready"):
-            t0 = time.time()
-            while (time.time() - t0) < 2.0 and not bool(client.services_are_ready()):
-                rclpy.spin_once(self, timeout_sec=0.05)
-            ok = bool(client.services_are_ready())
-
-        if not ok:
-            self.get_logger().warning(
-                f"Parameter services not available for node '{node_name}'. Publishing in policy order."
-            )
-            return
-
-        fut = client.get_parameters([param_name])
-        rclpy.spin_until_future_complete(self, fut, timeout_sec=2.0)
-        if fut.result() is None:
-            self.get_logger().warning(
-                f"Failed to read param '{param_name}' from node '{node_name}'. Publishing in policy order."
-            )
-            return
-
-        params_msg = fut.result()
-        values = getattr(params_msg, "values", None)
-        if values is None or len(values) != 1:
-            self.get_logger().warning(
-                f"Unexpected response reading param '{param_name}' from node '{node_name}'. Publishing in policy order."
-            )
-            return
-
-        v = values[0]
-        joints_ros = list(getattr(v, "string_array_value", []) or [])
+        
+        joints_ros = self._get_remote_string_array_param(node_name=node_name, param_name=param_name, timeout_sec=2.0)
         if not joints_ros:
-            self.get_logger().warning(
-                f"Param '{param_name}' from '{node_name}' is empty or not a string array. Publishing in policy order."
-            )
-            return
-
-        self._cmd_joint_order_ros = [str(x) for x in joints_ros]
+             self.get_logger().warning(
+                 f"Param '{param_name}' from '{node_name}' is empty or not a string array. Publishing in policy order."
+             )
+             return
+        
+        self._cmd_joint_order_ros = joints_ros
 
         # Build ROS->policy map (optional). If missing, identity is used.
         ros_to_policy, _ = build_joint_maps(self.bundle.robot_interface.joints or {})
