@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from .base import Term
+from .base import TermBase
 from .registry import register
 from .joints import build_joint_maps, joint_state_to_policy_vector
 
 @register("joint_vel_rel")
 @register("joint_vel")
-class JointVelRel(Term):
+class JointVelRel(TermBase):
     def compute(self) -> np.ndarray:
         src = self.wiring["source"]
         msg = self.sources.get(src)

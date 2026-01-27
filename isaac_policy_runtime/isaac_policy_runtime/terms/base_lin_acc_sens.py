@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import math
 
-from .base import Term
+from .base import TermBase
 from .registry import register
 
 def _quat_to_rot(qx, qy, qz, qw):
@@ -19,7 +19,7 @@ def _quat_to_rot(qx, qy, qz, qw):
     ], dtype=np.float32)
 
 @register("base_lin_acc_sens")
-class BaseLinAccSens(Term):
+class BaseLinAccSens(TermBase):
     def compute(self) -> np.ndarray:
         src = self.wiring["source"]
         msg = self.sources.get(src)

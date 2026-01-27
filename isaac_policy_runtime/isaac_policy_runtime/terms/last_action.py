@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from .base import Term
+from .base import TermBase
 from .registry import register
 
 @register("last_action")
-class LastAction(Term):
+class LastAction(TermBase):
     def compute(self) -> np.ndarray:
         if self.state.last_action is None:
             # size equals action dimension for joint_position policies

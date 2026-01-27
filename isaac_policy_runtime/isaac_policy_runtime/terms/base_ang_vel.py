@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from .base import Term
+from .base import TermBase
 from .registry import register
 
 @register("base_ang_vel")
-class BaseAngVel(Term):
+class BaseAngVel(TermBase):
     def compute(self) -> np.ndarray:
         src = self.wiring["source"]
         msg = self.sources.get(src)

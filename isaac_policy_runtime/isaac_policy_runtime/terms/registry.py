@@ -1,36 +1,31 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Type
+from typing import Callable, Dict, Type
 
-# func_name -> Term class
-_REGISTRY: Dict[str, Type[Any]] = {}
+from .base import TermBase
 
-# IsaacLab / export 名と runtime 名のズレを吸収する
-_ALIAS: Dict[str, str] = {
-    # IsaacLab observation name
+_REGISTRY: Dict[str, Type[TermBase]] = {}
+_ALIASES: Dict[str, str] = {
+    # IsaacLab obs term name 'actions' corresponds to our last_action term
     "actions": "last_action",
 }
 
 
-def register(func_name: str):
-    """Decorator to register a Term class under a given function name."""
+def register(func_name: str, *, aliases: list[str] | None = None) -> Callable[[Type[TermBase]], Type[TermBase]]:
+    """Decorator to register a term class by its function name."""
 
-    def _decorator(cls: Type[Any]) -> Type[Any]:
-        if func_name in _REGISTRY:
-            raise KeyError(
-                f"Term already registered for func '{func_name}' -> {_REGISTRY[func_name]}"
-            )
+    def deco(cls: Type[TermBase]) -> Type[TermBase]:
         _REGISTRY[func_name] = cls
+        if aliases:
+            for a in aliases:
+                _ALIASES[a] = func_name
         return cls
 
-    return _decorator
+    return deco
 
 
-def get_term_class(func_name: str) -> Type[Any]:
-    resolved = _ALIAS.get(func_name, func_name)
-    if resolved not in _REGISTRY:
-        raise KeyError(
-            f"No term registered for func '{func_name}'. "
-            f"Available: {sorted(_REGISTRY.keys())}"
-        )
-    return _REGISTRY[resolved]
+def get_term_class(func_name: str) -> Type[TermBase]:
+    key = _ALIASES.get(func_name, func_name)
+    if key not in _REGISTRY:
+        raise KeyError(f"No term registered for func '{func_name}'. Available: {sorted(_REGISTRY.keys())}")
+    return _REGISTRY[key]

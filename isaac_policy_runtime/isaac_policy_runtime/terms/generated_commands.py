@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .base import Term
+from .base import TermBase
 from .registry import register
 
 def _get_twist_attr(msg, path: str) -> float:
@@ -13,7 +13,7 @@ def _get_twist_attr(msg, path: str) -> float:
 
 @register("generated_commands")
 @register("velocity_commands")
-class VelocityCommands(Term):
+class VelocityCommands(TermBase):
     def compute(self) -> np.ndarray:
         src = self.wiring["source"]
         msg = self.sources.get(src)

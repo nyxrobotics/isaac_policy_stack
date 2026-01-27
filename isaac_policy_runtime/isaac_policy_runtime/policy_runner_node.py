@@ -20,11 +20,18 @@ from .control.sinks.ros2_control_topic import Ros2ControlTopicSink
 from .terms.joints import build_joint_maps
 import isaac_policy_runtime.terms  # noqa: F401
 
-try:
-    # ROS 2 helper to query remote node parameters (e.g. controller joints order).
-    from rclpy.parameter_client import AsyncParameterClient
+# ROS 2 helper to query remote node parameters (e.g. controller joints order).
+# Depending on distro, the class name may vary. We support both.
+AsyncParameterClient = None
+try:  # pragma: no cover
+    from rclpy.parameter_client import AsyncParameterClient as _APC  # type: ignore
+    AsyncParameterClient = _APC
 except Exception:  # pragma: no cover
-    AsyncParameterClient = None
+    try:
+        from rclpy.parameter_client import AsyncParametersClient as _APCs  # type: ignore
+        AsyncParameterClient = _APCs
+    except Exception:
+        AsyncParameterClient = None
 
 
 class PolicyRunner(Node):
@@ -49,7 +56,13 @@ class PolicyRunner(Node):
         if ort is None:
             raise RuntimeError("onnxruntime is not installed. Install it with: pip install onnxruntime")
 
-        self.sess = ort.InferenceSession(str(self.bundle.policy_onnx), providers=["CPUExecutionProvider"])
+        # Prefer GPU if available, fallback to CPU.
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        try:
+            self.sess = ort.InferenceSession(str(self.bundle.policy_onnx), providers=providers)
+        except Exception:
+            self.sess = ort.InferenceSession(str(self.bundle.policy_onnx), providers=["CPUExecutionProvider"])
+
         self.input_name = self.sess.get_inputs()[0].name
         self.output_name = self.sess.get_outputs()[0].name
 
@@ -111,7 +124,8 @@ class PolicyRunner(Node):
             self.get_logger().info(f"Control topic: {topic} @ rate_hz={self.rate_hz}, decimation={self.decimation}")
             if self._cmd_joint_order_ros is not None:
                 self.get_logger().info(
-                    f"Controller joints resolved via ROS params ({len(self._cmd_joint_order_ros)}): {self._cmd_joint_order_ros}"
+                    "Controller joints resolved via ROS params "
+                    f"({len(self._cmd_joint_order_ros)}): {self._cmd_joint_order_ros}"
                 )
 
         period = 1.0 / self.rate_hz
@@ -201,7 +215,18 @@ class PolicyRunner(Node):
             return
 
         client = AsyncParameterClient(self, node_name)
-        if not client.wait_for_services(timeout_sec=2.0):
+
+        # rclpy provides wait_for_services()/services_are_ready() depending on version.
+        ok = False
+        if hasattr(client, "wait_for_services"):
+            ok = bool(client.wait_for_services(timeout_sec=2.0))
+        elif hasattr(client, "services_are_ready"):
+            t0 = time.time()
+            while (time.time() - t0) < 2.0 and not bool(client.services_are_ready()):
+                rclpy.spin_once(self, timeout_sec=0.05)
+            ok = bool(client.services_are_ready())
+
+        if not ok:
             self.get_logger().warning(
                 f"Parameter services not available for node '{node_name}'. Publishing in policy order."
             )
@@ -215,23 +240,16 @@ class PolicyRunner(Node):
             )
             return
 
-        params = fut.result()
-        if not params or len(params) != 1:
+        params_msg = fut.result()
+        values = getattr(params_msg, "values", None)
+        if values is None or len(values) != 1:
             self.get_logger().warning(
                 f"Unexpected response reading param '{param_name}' from node '{node_name}'. Publishing in policy order."
             )
             return
 
-        p = params[0]
-        joints_ros = None
-        try:
-            joints_ros = list(p.string_array_value)
-        except Exception:
-            try:
-                joints_ros = list(getattr(p, "value"))
-            except Exception:
-                joints_ros = None
-
+        v = values[0]
+        joints_ros = list(getattr(v, "string_array_value", []) or [])
         if not joints_ros:
             self.get_logger().warning(
                 f"Param '{param_name}' from '{node_name}' is empty or not a string array. Publishing in policy order."
@@ -245,8 +263,8 @@ class PolicyRunner(Node):
         policy_order = list(self.bundle.action_config.joint_order)
         pol_index = {name: i for i, name in enumerate(policy_order)}
 
-        idx = []
-        missing = []
+        idx: list[int] = []
+        missing: list[dict[str, str]] = []
         for rn in self._cmd_joint_order_ros:
             pn = ros_to_policy.get(rn, rn)
             if pn in pol_index:
@@ -256,10 +274,10 @@ class PolicyRunner(Node):
                 missing.append({"ros": rn, "policy": pn})
 
         if missing and self.strict:
-            raise RuntimeError(
-                "Controller joint list contains joints not present in policy_joint_order: "
-                + ", ".join([f"{m['ros']}-> {m['policy']}" for m in missing])
+            msg = "Controller joint list contains joints not present in policy_joint_order: " + ", ".join(
+                [f"{m['ros']}-> {m['policy']}" for m in missing]
             )
+            raise RuntimeError(msg)
 
         self._cmd_to_policy_idx = np.asarray(idx, dtype=np.int32)
 
