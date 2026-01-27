@@ -31,6 +31,9 @@ def robot_interface_v1_skeleton(base_frame: str = "base") -> Dict[str, Any]:
             "sink": "ros2_control_topic",
             "mode": "position_targets",
             "topic": "/joint_group_pos_controller/commands",
+            # If true, add the initial measured joint position vector as an offset
+            # to every outgoing command (useful when the policy outputs deltas).
+            "relative": False,
             "rate_hz": 200,
             "decimation": 4,
         },

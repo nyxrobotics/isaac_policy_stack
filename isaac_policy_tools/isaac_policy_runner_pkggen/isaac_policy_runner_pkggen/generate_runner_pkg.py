@@ -6,6 +6,8 @@ import re
 import shutil
 from pathlib import Path
 
+import yaml
+
 
 def _sanitize_pkg_name(s: str) -> str:
     s = s.strip().lower()
@@ -19,6 +21,198 @@ def _sanitize_pkg_name(s: str) -> str:
 def _write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def _copytree(src: Path, dst: Path) -> None:
+    """Copy a directory tree (Python <3.8 compatible behavior).
+
+    shutil.copytree(..., dirs_exist_ok=True) is only available on newer Python,
+    so we implement an always-overwrite copy here.
+    """
+
+    if not src.is_dir():
+        raise NotADirectoryError(str(src))
+    dst.mkdir(parents=True, exist_ok=True)
+    for root, dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        out_dir = dst / rel if rel != "." else dst
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for d in dirs:
+            (out_dir / d).mkdir(parents=True, exist_ok=True)
+        for f in files:
+            shutil.copy2(Path(root) / f, out_dir / f)
+
+
+def _extract_action_offsets_from_io_descriptors(io_path: Path) -> dict[str, float] | None:
+    """Extract actions[0].offset aligned with actions[0].joint_names."""
+
+    if not io_path.exists():
+        return None
+
+    with io_path.open("r", encoding="utf-8") as f:
+        io = yaml.safe_load(f) or {}
+
+    actions = io.get("actions")
+    if not (isinstance(actions, list) and actions and isinstance(actions[0], dict)):
+        return None
+    a0 = actions[0]
+    jn = a0.get("joint_names")
+    off = a0.get("offset")
+    if not (isinstance(jn, list) and isinstance(off, list) and len(jn) == len(off) and len(jn) > 0):
+        return None
+    return {str(n): float(v) for n, v in zip(jn, off)}
+
+
+def _extract_joint_pos_offsets_from_io_descriptors(io_path: Path) -> dict[str, float] | None:
+    """Extract observation joint_pos_offsets aligned with observation joint_names.
+
+    Searches IO_descriptors.yaml observations/policy entries for the first item containing
+    both 'joint_pos_offsets' and 'joint_names'.
+    """
+
+    if not io_path.exists():
+        return None
+
+    with io_path.open("r", encoding="utf-8") as f:
+        io = yaml.safe_load(f) or {}
+
+    observations = io.get("observations")
+    if not isinstance(observations, dict):
+        return None
+    policy_list = observations.get("policy")
+    if not isinstance(policy_list, list):
+        return None
+
+    for e in policy_list:
+        if not isinstance(e, dict):
+            continue
+        jn = e.get("joint_names")
+        off = e.get("joint_pos_offsets")
+        if isinstance(jn, list) and isinstance(off, list) and len(jn) == len(off) and len(jn) > 0:
+            return {str(n): float(v) for n, v in zip(jn, off)}
+    return None
+
+
+def _write_offsets_yamls(bundle_dir: Path) -> None:
+    """Write action_offsets.yaml and joint_pos_offsets.yaml into a bundle when available."""
+
+    io_path = bundle_dir / "exported" / "IO_descriptors.yaml"
+
+    act = _extract_action_offsets_from_io_descriptors(io_path)
+    if act:
+        out = {
+            "version": 1,
+            "source": {"type": "isaaclab", "file": "exported/IO_descriptors.yaml"},
+            "joints": act,
+        }
+        (bundle_dir / "action_offsets.yaml").write_text(yaml.safe_dump(out, sort_keys=False), encoding="utf-8")
+
+    jpos = _extract_joint_pos_offsets_from_io_descriptors(io_path)
+    if jpos:
+        out = {
+            "version": 1,
+            "source": {"type": "isaaclab", "file": "exported/IO_descriptors.yaml"},
+            "joints": jpos,
+        }
+        (bundle_dir / "joint_pos_offsets.yaml").write_text(
+            yaml.safe_dump(out, sort_keys=False), encoding="utf-8"
+        )
+
+
+def _load_required_observation_terms(bundle_dir: Path) -> list[str]:
+    """Load required observation term names from io_descriptor.json (preferred).
+
+    Returns an empty list if io_descriptor.json is missing or unreadable.
+    """
+
+    io_desc = bundle_dir / "io_descriptor.json"
+    if not io_desc.exists():
+        return []
+    try:
+        import json
+
+        data = json.loads(io_desc.read_text(encoding="utf-8"))
+        obs = list(data.get("observations", []) or [])
+        names = [str(o.get("name")) for o in obs if isinstance(o, dict) and o.get("name")]
+        # De-dup while preserving order
+        seen: set[str] = set()
+        out: list[str] = []
+        for n in names:
+            if n not in seen:
+                seen.add(n)
+                out.append(n)
+        return out
+    except Exception:
+        return []
+
+
+def _ensure_term_inputs_template(bundle_dir: Path) -> None:
+    """Ensure robot_interface.yaml contains a term_inputs template for required terms."""
+
+    robot_if_path = bundle_dir / "robot_interface.yaml"
+    if not robot_if_path.exists():
+        return
+
+    rif = yaml.safe_load(robot_if_path.read_text(encoding="utf-8")) or {}
+    required_terms = _load_required_observation_terms(bundle_dir)
+    if not required_terms:
+        # Nothing to template.
+        return
+
+    term_inputs = dict(rif.get("term_inputs", {}) or {})
+
+    # Typical defaults (can be edited by the user).
+    typical = {
+        "base_ang_vel": {
+            "source": "imu",
+            "vector_field": "angular_velocity",
+        },
+        "base_lin_acc_sens": {
+            "source": "imu",
+            "vector_field": "linear_acceleration",
+        },
+        "velocity_commands": {
+            "source": "cmd_vel",
+            "mapping": {
+                "lin_x": "linear.x",
+                "lin_y": "linear.y",
+                "ang_z": "angular.z",
+            },
+        },
+        "joint_pos": {
+            "source": "joint_states",
+            "vector_field": "position",
+            "relative": True,
+        },
+        "joint_vel": {
+            "source": "joint_states",
+            "vector_field": "velocity",
+        },
+        "actions": {
+            "source": "internal",
+            "note": "Filled automatically by the runner (last_action).",
+        },
+    }
+
+    for name in required_terms:
+        if name in term_inputs:
+            continue
+        if name in typical:
+            term_inputs[name] = typical[name]
+        else:
+            term_inputs[name] = {
+                "source": "<write_your_topic>",
+                "note": "TODO: Fill in fields for this term.",
+            }
+
+    rif["term_inputs"] = term_inputs
+
+    # Ensure control.relative exists (default: false)
+    ctrl = dict(rif.get("control", {}) or {})
+    ctrl.setdefault("relative", False)
+    rif["control"] = ctrl
+
+    robot_if_path.write_text(yaml.safe_dump(rif, sort_keys=False), encoding="utf-8")
 
 
 def _render_package_xml(pkg: str) -> str:
@@ -132,6 +326,24 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="isaac-generate-runner-pkg")
     ap.add_argument("--ws_src", required=True, help="Workspace src/ directory (e.g., ~/ros2_humble/src)")
     ap.add_argument("--robot_name", required=True, help="Robot name (e.g., kuroko)")
+    ap.add_argument(
+        "--bundles_dir",
+        default=None,
+        help=(
+            "Optional directory containing one or more policy bundles. "
+            "Each direct child directory is copied into <pkg>/bundle/<policy_name>/ and "
+            "action_offsets.yaml and joint_pos_offsets.yaml are generated from exported/IO_descriptors.yaml when possible."
+        ),
+    )
+    ap.add_argument(
+        "--bundle",
+        action="append",
+        default=[],
+        help=(
+            "Optional: path to a single policy bundle directory. Can be specified multiple times. "
+            "Copied into <pkg>/bundle/<policy_name>/ and offsets yamls are generated when possible."
+        ),
+    )
     ap.add_argument("--force", action="store_true", help="Overwrite existing package directory")
     args = ap.parse_args(argv)
 
@@ -160,9 +372,45 @@ def main(argv: list[str] | None = None) -> int:
     _write_text(pkg_dir / "launch" / "isaac_policy_runner.launch.py", _render_launch_py(pkg))
     _write_text(pkg_dir / "resource" / pkg, "")
 
+    # ---- Optional: copy bundles and generate offsets yamls
+    bundle_dst_root = pkg_dir / "bundle"
+
+    bundle_sources: list[Path] = []
+    if args.bundles_dir is not None:
+        bd = Path(args.bundles_dir).expanduser().resolve()
+        if not bd.exists() or not bd.is_dir():
+            raise FileNotFoundError(f"--bundles_dir not found or not a directory: {bd}")
+        for child in sorted(bd.iterdir()):
+            if child.is_dir() and not child.name.startswith("."):
+                bundle_sources.append(child)
+
+    for b in args.bundle or []:
+        bp = Path(b).expanduser().resolve()
+        if not bp.exists() or not bp.is_dir():
+            raise FileNotFoundError(f"--bundle not found or not a directory: {bp}")
+        bundle_sources.append(bp)
+
+    # De-dup by resolved path
+    uniq: dict[str, Path] = {}
+    for p in bundle_sources:
+        uniq[str(p)] = p
+
+    for src_bundle in uniq.values():
+        policy_name = src_bundle.name
+        dst_bundle = bundle_dst_root / policy_name
+        if dst_bundle.exists():
+            shutil.rmtree(dst_bundle)
+        _copytree(src_bundle, dst_bundle)
+        _write_offsets_yamls(dst_bundle)
+        _ensure_term_inputs_template(dst_bundle)
+
     print(f"[OK] Generated package: {pkg_dir}")
     print(f"Build: colcon build --packages-select {pkg}")
     print("Note: bundle/** is installed. After adding/updating bundles, rebuild the runner package.")
+    if uniq:
+        print(
+            "Note: action_offsets.yaml and joint_pos_offsets.yaml were generated for bundles that contain exported/IO_descriptors.yaml offsets."
+        )
     print(f"Run:   ros2 launch {pkg} isaac_policy_runner.launch.py policy_name:=<policy_name>")
     return 0
 

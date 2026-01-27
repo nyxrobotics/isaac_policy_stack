@@ -36,6 +36,33 @@ isaac-generate-runner-pkg \
   --force
 ```
 
+### Copy bundles and auto-generate offsets yamls (recommended)
+
+If your policy bundles contain `exported/IO_descriptors.yaml` with offsets,
+this tool can copy bundles into the generated package and write `action_offsets.yaml` and
+`joint_pos_offsets.yaml` into each bundle (when the offsets can be extracted).
+
+Copy all bundles from a directory:
+
+```bash
+isaac-generate-runner-pkg \
+  --ws_src ~/ros2_humble/src/kuroko_ros2 \
+  --robot_name kuroko \
+  --bundles_dir /path/to/bundles \
+  --force
+```
+
+Or copy specific bundles:
+
+```bash
+isaac-generate-runner-pkg \
+  --ws_src ~/ros2_humble/src/kuroko_ros2 \
+  --robot_name kuroko \
+  --bundle /path/to/bundles/kuroko_walk \
+  --bundle /path/to/bundles/kuroko_trot \
+  --force
+```
+
 ## Add a bundle
 
 Place a bundle under:

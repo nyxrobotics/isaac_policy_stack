@@ -193,7 +193,13 @@ def _write_metadata(cfg: ExportConfig) -> None:
         "layout": {
             "exported_dir": "exported/",
             "exported_artifacts": ["policy.onnx", "policy.pt", "IO_descriptors.yaml"],
-            "runtime_abi_files": ["io_descriptor.json", "action_config.json", "obs_normalization.json"],
+            "runtime_abi_files": [
+                "io_descriptor.json",
+                "action_config.json",
+                "action_offsets.yaml",
+                "joint_pos_offsets.yaml",
+                "obs_normalization.json",
+            ],
         },
         "runtime_assumptions": {
             "controller_joint_order_resolution": {
@@ -208,6 +214,98 @@ def _write_metadata(cfg: ExportConfig) -> None:
         },
     }
     _write_yaml(cfg.bundle_out / "metadata.yaml", metadata, force=cfg.force)
+
+
+def _zip_to_joint_map(joint_names: Any, values: Any) -> Optional[dict[str, float]]:
+    if not isinstance(joint_names, list) or not isinstance(values, list):
+        return None
+    if len(joint_names) != len(values):
+        return None
+    out: dict[str, float] = {}
+    for n, v in zip(joint_names, values):
+        out[str(n)] = float(v)
+    return out
+
+
+def _write_offsets_from_io_descriptors(io: dict[str, Any], bundle_out: Path, force: bool) -> None:
+    # ---- action_offsets.yaml from actions[0].offset
+    actions = io.get("actions", None)
+    if isinstance(actions, list) and len(actions) > 0 and isinstance(actions[0], dict):
+        a0 = actions[0]
+        jm = _zip_to_joint_map(a0.get("joint_names"), a0.get("offset"))
+        if jm is not None:
+            _write_yaml(
+                bundle_out / "action_offsets.yaml",
+                {
+                    "version": 1,
+                    "source": {"type": "isaaclab", "file": "exported/IO_descriptors.yaml"},
+                    "joints": jm,
+                },
+                force=force,
+            )
+
+    # ---- joint_pos_offsets.yaml from observations.policy[name==joint_pos_rel].joint_pos_offsets
+    obs_terms = io.get("observations", {}).get("policy", None)
+    if isinstance(obs_terms, list):
+        for term in obs_terms:
+            if not isinstance(term, dict):
+                continue
+            if term.get("name") == "joint_pos_rel":
+                jm = _zip_to_joint_map(term.get("joint_names"), term.get("joint_pos_offsets"))
+                if jm is not None:
+                    _write_yaml(
+                        bundle_out / "joint_pos_offsets.yaml",
+                        {
+                            "version": 1,
+                            "source": {"type": "isaaclab", "file": "exported/IO_descriptors.yaml"},
+                            "joints": jm,
+                        },
+                        force=force,
+                    )
+                break
+
+
+def _merge_term_inputs_from_required_terms(bundle_out: Path, required_terms: list[str], force: bool) -> None:
+    """Update robot_interface.yaml term_inputs with a template covering all required terms.
+
+    - Known common terms are filled with reasonable defaults.
+    - Unknown terms are added with a placeholder source: <write_your_topic>
+    """
+    robot_if_path = bundle_out / "robot_interface.yaml"
+    if not robot_if_path.exists():
+        return
+
+    with robot_if_path.open("r", encoding="utf-8") as f:
+        robot_if = yaml.safe_load(f) or {}
+
+    term_inputs: dict[str, Any] = robot_if.get("term_inputs") or {}
+
+    # Typical mappings
+    defaults: dict[str, Any] = {
+        "base_ang_vel": {"source": "imu", "vector_field": "angular_velocity"},
+        "base_lin_acc_sens": {"source": "imu", "vector_field": "linear_acceleration"},
+        "velocity_commands": {
+            "source": "cmd_vel",
+            "mapping": {"lin_x": "linear.x", "lin_y": "linear.y", "ang_z": "angular.z"},
+        },
+        "joint_pos": {"source": "joint_states", "vector_field": "position", "relative": True},
+        "joint_vel": {"source": "joint_states", "vector_field": "velocity"},
+        # Runner populates this internally (previous action)
+        "actions": {"source": "internal"},
+    }
+
+    for t in required_terms:
+        if t in term_inputs:
+            continue
+        if t in defaults:
+            term_inputs[t] = defaults[t]
+        else:
+            term_inputs[t] = {"source": "<write_your_topic>"}
+
+    robot_if["term_inputs"] = term_inputs
+
+    # Always write back if force OR we added something.
+    _write_yaml(robot_if_path, robot_if, force=True if force else True)
 
 
 def _write_robot_interface(cfg: ExportConfig) -> None:
@@ -230,6 +328,9 @@ def _write_robot_interface(cfg: ExportConfig) -> None:
         "command_topic": cfg.command_topic,
         "command_msg_type": cfg.command_msg_type,
         "rate_hz": 50,
+        # If true, add the initial measured joint position vector as an offset
+        # to every outgoing command (useful when the policy outputs deltas).
+        "relative": False,
         # Explicitly state: order is resolved at runtime via ROS params
         "command_joint_order": None,
         "command_joint_order_resolution": {
@@ -287,6 +388,10 @@ def _generate_runtime_abi_from_io_descriptors(cfg: ExportConfig) -> None:
     with io_yaml.open("r", encoding="utf-8") as f:
         io = yaml.safe_load(f)
 
+    # Write offsets YAMLs (if present)
+    if isinstance(io, dict):
+        _write_offsets_from_io_descriptors(io, cfg.bundle_out, force=cfg.force)
+
     # ---- Observations (policy group)
     obs_terms = io.get("observations", {}).get("policy", None)
     if not isinstance(obs_terms, list) or len(obs_terms) == 0:
@@ -301,6 +406,7 @@ def _generate_runtime_abi_from_io_descriptors(cfg: ExportConfig) -> None:
     }
 
     out_obs: list[dict[str, Any]] = []
+    required_terms: list[str] = []
     total_dim = 0
     for term in obs_terms:
         src_name = term.get("name")
@@ -321,6 +427,7 @@ def _generate_runtime_abi_from_io_descriptors(cfg: ExportConfig) -> None:
         total_dim += dim
 
         out_obs.append({"name": dst_name, "shape": shape_list})
+        required_terms.append(dst_name)
 
     io_desc = {
         "version": 1,
@@ -331,6 +438,9 @@ def _generate_runtime_abi_from_io_descriptors(cfg: ExportConfig) -> None:
         "name_map": name_map,
     }
     _write_json(cfg.bundle_out / "io_descriptor.json", io_desc, force=cfg.force)
+
+    # Ensure robot_interface.yaml contains a template term_inputs covering all required terms.
+    _merge_term_inputs_from_required_terms(cfg.bundle_out, required_terms, force=cfg.force)
 
     # ---- Actions: policy joint order only (NOT controller order)
     actions = io.get("actions", None)
@@ -354,8 +464,6 @@ def _generate_runtime_abi_from_io_descriptors(cfg: ExportConfig) -> None:
         "source": {"type": "isaaclab", "file": "exported/IO_descriptors.yaml"},
     }
     _write_json(cfg.bundle_out / "action_config.json", action_cfg, force=cfg.force)
-
-
 def _write_placeholders_if_needed(cfg: ExportConfig) -> None:
     _ensure_dir(cfg.bundle_out / "exported")
 

@@ -8,7 +8,7 @@ version = "0.1.1"
 description = "Generate <robot>_isaac_policy_runner ROS 2 ament_python packages with launch files."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["PyYAML>=6.0"]
 
 [project.scripts]
 isaac-generate-runner-pkg = "isaac_policy_runner_pkggen.generate_runner_pkg:main"

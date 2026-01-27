@@ -18,7 +18,7 @@ from .io.source_manager import SourceManager
 from .terms.base import RuntimeState
 from .terms.registry import get_term_class
 from .control.sinks.ros2_control_topic import Ros2ControlTopicSink
-from .terms.joints import build_joint_maps
+from .terms.joints import build_joint_maps, joint_state_to_policy_vector
 import isaac_policy_runtime.terms  # noqa: F401
 
 # ROS 2 helper to query remote node parameters (e.g. controller joints order).
@@ -99,6 +99,13 @@ class PolicyRunner(Node):
         topic = str(ctrl.get("command_topic", ctrl.get("topic", "/joint_group_position_controller/commands")))
         self.sink = Ros2ControlTopicSink(node=self, topic=topic)
 
+        # Optional: publish targets relative to an offset.
+        # If the bundle provides action offsets (action_offsets.yaml), we use them.
+        # Otherwise, we fall back to capturing the current JointState.position at startup.
+        self.control_relative = bool(ctrl.get("relative", False))
+        self._control_offset: np.ndarray | None = None
+        self._action_offsets: dict[str, float] = dict(ctrl.get("action_offsets", {}) or {})
+
         # Resolve controller joint order at runtime (optional but recommended)
         self._cmd_joint_order_ros: list[str] | None = None
         self._cmd_to_policy_idx: np.ndarray | None = None
@@ -153,8 +160,81 @@ class PolicyRunner(Node):
 
         self.state.last_action = action.copy()
 
+        # Lazily capture initial joint offset for relative control.
+        if self.control_relative and self._control_offset is None:
+            self._control_offset = self._build_control_offset()
+
         q_target = self._decode_joint_position(action)
+        if self.control_relative and self._control_offset is not None:
+            if q_target.shape == self._control_offset.shape:
+                q_target = q_target + self._control_offset
+            else:
+                self.get_logger().warning(
+                    f"control.relative enabled but offset shape {self._control_offset.shape} != target {q_target.shape}; ignoring offset"
+                )
         self.sink.publish_positions(q_target)
+
+    def _build_control_offset(self) -> np.ndarray | None:
+        """Build the outgoing command offset vector.
+
+        Priority:
+          1) Use action_offsets.yaml (loaded into robot_interface.control['action_offsets'])
+          2) Fallback: capture current JointState.position
+
+        Returns None if neither is available.
+        """
+
+        off = self._build_control_offset_from_action_offsets()
+        if off is not None:
+            return off
+        return self._capture_initial_control_offset()
+
+    def _build_control_offset_from_action_offsets(self) -> np.ndarray | None:
+        if not self._action_offsets:
+            return None
+
+        # Build in controller joint order if resolved.
+        if self._cmd_joint_order_ros is not None:
+            ros_to_policy, _ = build_joint_maps(self.bundle.robot_interface.joints or {})
+            out: list[float] = []
+            for rn in self._cmd_joint_order_ros:
+                pn = str(ros_to_policy.get(str(rn), str(rn)))
+                out.append(float(self._action_offsets.get(pn, 0.0)))
+            return np.asarray(out, dtype=np.float32)
+
+        # Otherwise: build in policy action joint order.
+        out = [float(self._action_offsets.get(j, 0.0)) for j in self.bundle.action_config.joint_order]
+        return np.asarray(out, dtype=np.float32)
+
+    def _capture_initial_control_offset(self) -> np.ndarray | None:
+        """Capture initial joint positions in the outgoing command order.
+
+        Returns None if joint_states is unavailable.
+        """
+
+        js = self.sources.get("joint_states")
+        if js is None:
+            return None
+
+        # If we have controller joint order, capture in that order (ROS joint names).
+        if self._cmd_joint_order_ros is not None:
+            name_to_pos = {str(n): float(p) for n, p in zip(list(getattr(js, "name", []) or []), list(getattr(js, "position", []) or []))}
+            out = [float(name_to_pos.get(rn, 0.0)) for rn in self._cmd_joint_order_ros]
+            return np.asarray(out, dtype=np.float32)
+
+        # Otherwise, fallback to policy joint order and apply ROS->policy name mapping.
+        ros_to_policy, _ = build_joint_maps(self.bundle.robot_interface.joints or {})
+        try:
+            q0_policy = joint_state_to_policy_vector(
+                ros_names=[str(x) for x in list(getattr(js, "name", []) or [])],
+                values=[float(x) for x in list(getattr(js, "position", []) or [])],
+                action_joint_order=list(self.bundle.action_config.joint_order),
+                ros_to_policy=ros_to_policy,
+                strict=False,
+            )
+        except Exception:
+            return None
+        return q0_policy
 
     def _decode_joint_position(self, action: np.ndarray) -> np.ndarray:
         cfg = self.bundle.action_config
