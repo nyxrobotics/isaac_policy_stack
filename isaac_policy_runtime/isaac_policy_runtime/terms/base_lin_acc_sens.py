@@ -26,7 +26,7 @@ class BaseLinAccSens(TermBase):
         if msg is None:
             return np.zeros((3,), dtype=np.float32)
 
-        acc_field = self.wiring.get("vector_field", "linear_acceleration")
+        acc_field = self.wiring.get("data_field") or self.wiring.get("vector_field", "linear_acceleration")
         ori_field = self.wiring.get("orientation_field", "orientation")
         provides_specific_force = bool(self.wiring.get("provides_specific_force", False))
         gmag = float(self.wiring.get("gravity_mag", 9.81))

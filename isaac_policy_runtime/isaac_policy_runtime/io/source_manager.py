@@ -53,13 +53,13 @@ class SourceManager:
     def _resolve_msg_type(self, type_str: str):
         # Minimal resolver for common types used in v1.
         # Extend as needed.
-        if type_str == "sensor_msgs/Imu":
+        if type_str in ("sensor_msgs/Imu", "sensor_msgs/msg/Imu"):
             from sensor_msgs.msg import Imu
             return Imu
-        if type_str == "sensor_msgs/JointState":
+        if type_str in ("sensor_msgs/JointState", "sensor_msgs/msg/JointState"):
             from sensor_msgs.msg import JointState
             return JointState
-        if type_str == "geometry_msgs/Twist":
+        if type_str in ("geometry_msgs/Twist", "geometry_msgs/msg/Twist"):
             from geometry_msgs.msg import Twist
             return Twist
         raise ValueError(f"Unsupported msg_type '{type_str}'. Add it to SourceManager._resolve_msg_type().")

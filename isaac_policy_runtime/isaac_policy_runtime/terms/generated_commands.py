@@ -20,6 +20,12 @@ class VelocityCommands(TermBase):
         if msg is None:
             return np.zeros((3,), dtype=np.float32)
 
+
+        data_field = self.wiring.get("data_field")
+        if isinstance(data_field, list) and len(data_field) > 0:
+            vals = [_get_twist_attr(msg, str(p)) for p in data_field]
+            return np.asarray(vals, dtype=np.float32)
+
         mapping = self.wiring.get("mapping", {
             "lin_x": "linear.x",
             "lin_y": "linear.y",

@@ -12,10 +12,6 @@ def robot_interface_v1_skeleton(base_frame: str = "base") -> Dict[str, Any]:
             "joint_states": {"msg_type": "sensor_msgs/JointState", "topic": "/joint_states"},
             "cmd_vel": {"msg_type": "geometry_msgs/Twist", "topic": "/cmd_vel"},
         },
-        "joints": {
-            "name_map": {},      # optional: ROS joint name -> policy joint name
-            "default_pos": {},   # optional: policy joint defaults (for *_rel)
-        },
         "term_inputs": {
             # Fill with keys matching io_descriptor.json observation term names.
             # Example:
@@ -33,5 +29,8 @@ def robot_interface_v1_skeleton(base_frame: str = "base") -> Dict[str, Any]:
             "topic": "/joint_group_pos_controller/commands",
             "rate_hz": 200,
             "decimation": 4,
+            # Default: both action and joint-state observations are treated as "relative" (add/subtract offsets).
+            "action_relative": True,
+            "observation_relative": True,
         },
     }

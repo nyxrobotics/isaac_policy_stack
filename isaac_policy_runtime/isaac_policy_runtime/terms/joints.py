@@ -13,7 +13,7 @@ def build_joint_maps(joints_cfg: dict) -> tuple[dict[str, str], dict[str, str]]:
 def joint_state_to_policy_vector(
     ros_names: list[str],
     values: list[float],
-    action_joint_order: list[str],
+    joint_order: list[str],
     ros_to_policy: dict[str, str],
     strict: bool,
 ) -> np.ndarray:
@@ -25,7 +25,7 @@ def joint_state_to_policy_vector(
 
     out = []
     missing = []
-    for pn in action_joint_order:
+    for pn in joint_order:
         if pn in pol_vals:
             out.append(pol_vals[pn])
         else:
@@ -33,5 +33,5 @@ def joint_state_to_policy_vector(
             out.append(0.0)
 
     if strict and missing:
-        raise KeyError(f"Missing joints in JointState for policy joint_order: {missing}")
+        raise KeyError(f"Missing joints in JointState for joint_order: {missing}")
     return np.asarray(out, dtype=np.float32)

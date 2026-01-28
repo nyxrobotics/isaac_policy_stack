@@ -7,15 +7,15 @@ from typing import Any, Dict
 
 import yaml
 
-from .schema import ActionConfig, ObservationSpec, RobotInterface, SourceSpec
+from .schema import ActionConfig, ObservationConfig, ObservationSpec, RobotInterface, SourceSpec
 
 
 @dataclass(frozen=True)
 class PolicyBundle:
     root: Path
     policy_onnx: Path
-    io_descriptor: Dict[str, Any]
-    observations: list[ObservationSpec]
+    io_descriptors: Dict[str, Any] | None
+    observation_config: ObservationConfig
     action_config: ActionConfig
     robot_interface: RobotInterface
     obs_normalization: Dict[str, Any] | None
@@ -26,6 +26,155 @@ def _require(path: Path) -> None:
     if not path.exists():
         raise FileNotFoundError(str(path))
 
+def _prod(shape: list[int] | None) -> int | None:
+    if not shape:
+        return None
+    d = 1
+    for s in shape:
+        d *= int(s)
+    return int(d)
+
+
+
+def _load_io_descriptors_yaml(root: Path) -> dict[str, Any] | None:
+    """Load Isaac Lab IO_descriptors.yaml (preferred: io_descriptors.yaml copy).
+
+    We accept multiple filenames for backwards-compatibility:
+      - <bundle>/io_descriptors.yaml              (preferred, lowercase)
+      - <bundle>/exported/IO_descriptors.yaml     (exported by isaac_policy_export)
+      - <bundle>/IO_descriptors.yaml              (legacy)
+    """
+    candidates = [
+        root / "io_descriptors.yaml",
+        root / "exported" / "IO_descriptors.yaml",
+        root / "IO_descriptors.yaml",
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                data = yaml.safe_load(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                return None
+    return None
+
+
+def _find_obs_term(ioy: dict[str, Any], name: str) -> dict[str, Any] | None:
+    obs = (ioy or {}).get("observations") or {}
+    policy = obs.get("policy") if isinstance(obs, dict) else None
+    if not isinstance(policy, list):
+        return None
+    for t in policy:
+        if isinstance(t, dict) and str(t.get("name")) == name:
+            return t
+    return None
+
+
+def _load_action_config_yaml(root: Path) -> dict[str, Any] | None:
+    p = root / "action_config.yaml"
+    if not p.exists():
+        return None
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _load_observation_config_yaml(root: Path) -> dict[str, Any] | None:
+    p = root / "observation_config.yaml"
+    if not p.exists():
+        return None
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _build_configs_from_io_descriptors(ioy: dict[str, Any], default_action_use_default_offset: bool = True) -> tuple[ActionConfig, ObservationConfig]:
+    # ---- Actions
+    actions_list = ioy.get("actions") if isinstance(ioy, dict) else None
+    if not (isinstance(actions_list, list) and len(actions_list) > 0 and isinstance(actions_list[0], dict)):
+        raise RuntimeError("io_descriptors.yaml is missing 'actions[0]' entry")
+
+    a0 = actions_list[0]
+    joint_order = [str(x) for x in list(a0.get("joint_names") or [])]
+    if not joint_order:
+        raise RuntimeError("io_descriptors.yaml actions[0].joint_names is empty")
+
+    offset = None
+    if isinstance(a0.get("offset"), list):
+        offset = [float(x) for x in list(a0.get("offset") or [])]
+
+    clip = a0.get("clip")
+    clip_tuple = (-1.0, 1.0)
+    if isinstance(clip, list) and len(clip) == 2:
+        clip_tuple = (float(clip[0]), float(clip[1]))
+
+    scale = None
+    if a0.get("scale") is not None:
+        try:
+            scale = float(a0.get("scale"))
+        except Exception:
+            scale = None
+
+    action_cfg = ActionConfig(
+        type="joint_position",
+        joint_order=joint_order,
+        scale=scale,
+        use_default_offset=bool(default_action_use_default_offset),
+        offset=offset,
+        relative=True,
+        clip=clip_tuple,
+    )
+
+    # ---- Observations
+    obs = (ioy.get("observations") or {}) if isinstance(ioy, dict) else {}
+    policy = obs.get("policy") if isinstance(obs, dict) else None
+    if not isinstance(policy, list) or len(policy) == 0:
+        raise RuntimeError("io_descriptors.yaml observations.policy is empty")
+
+    terms: list[ObservationSpec] = []
+    total_dim = 0
+    for t in policy:
+        if not isinstance(t, dict):
+            raise RuntimeError(f"Invalid observation term: {t}")
+        name = str(t.get("name"))
+        shape_raw = t.get("shape")
+        if shape_raw is None:
+            raise RuntimeError(f"Observation term '{name}' missing shape")
+        if isinstance(shape_raw, int):
+            shape = [int(shape_raw)]
+        else:
+            shape = [int(x) for x in list(shape_raw)]
+        dim = _prod(shape) or 0
+        total_dim += dim
+
+        params: dict[str, Any] = {}
+        if isinstance(t.get("joint_names"), list):
+            params["joint_order"] = [str(x) for x in list(t.get("joint_names") or [])]
+        if isinstance(t.get("joint_pos_offsets"), list):
+            params["offsets"] = [float(x) for x in list(t.get("joint_pos_offsets") or [])]
+        if isinstance(t.get("joint_vel_offsets"), list):
+            params["offsets"] = [float(x) for x in list(t.get("joint_vel_offsets") or [])]
+        if params:
+            params.setdefault("relative", True)
+
+        terms.append(
+            ObservationSpec(
+                name=name,
+                func=name,
+                params=params if params else None,
+                clip=None,
+                shape=shape,
+                dim=int(dim),
+            )
+        )
+
+    obs_cfg = ObservationConfig(terms=terms, total_dim=int(total_dim))
+    return action_cfg, obs_cfg
 
 def load_bundle(bundle_path: str) -> PolicyBundle:
     root = Path(bundle_path).expanduser().resolve()
@@ -36,38 +185,65 @@ def load_bundle(bundle_path: str) -> PolicyBundle:
     if not policy_onnx.exists():
         policy_onnx = root / "policy.onnx"
 
-    io_desc_path = root / "io_descriptor.json"
-    action_cfg_path = root / "action_config.json"
+    action_cfg_path = root / "action_config.yaml"
+    obs_cfg_path = root / "observation_config.yaml"
     robot_if_path = root / "robot_interface.yaml"
 
     _require(policy_onnx)
-    _require(io_desc_path)
-    _require(action_cfg_path)
     _require(robot_if_path)
 
-    io_desc = json.loads(io_desc_path.read_text(encoding="utf-8"))
-    obs_specs: list[ObservationSpec] = []
-    for o in io_desc.get("observations", []):
-        obs_specs.append(
-            ObservationSpec(
-                name=o["name"],
-                func=o.get("func", o["name"]),
-                params=o.get("params"),
-                clip=tuple(o["clip"]) if o.get("clip") else None,
+
+    io_desc_yaml = _load_io_descriptors_yaml(root)
+
+    # Load YAML configs if available; otherwise build from io_descriptors.yaml.
+    acy = _load_action_config_yaml(root)
+    ocy = _load_observation_config_yaml(root)
+
+    if acy is None or ocy is None:
+        if io_desc_yaml is None:
+            missing = []
+            if acy is None:
+                missing.append("action_config.yaml")
+            if ocy is None:
+                missing.append("observation_config.yaml")
+            raise FileNotFoundError(
+                f"Missing {', '.join(missing)} and no io_descriptors.yaml found to derive them"
             )
+        action_config, observation_config = _build_configs_from_io_descriptors(io_desc_yaml)
+    else:
+        action_config = ActionConfig(
+            type=str(acy.get("type", "joint_position")),
+            joint_order=[str(x) for x in list(acy.get("joint_order") or acy.get("policy_joint_order") or [])],
+            scale=float(acy["scale"]) if acy.get("scale") is not None else None,
+            use_default_offset=bool(acy.get("use_default_offset")) if acy.get("use_default_offset") is not None else None,
+            offset=[float(x) for x in list(acy.get("offset") or [])] if isinstance(acy.get("offset"), list) else None,
+            relative=bool(acy.get("relative")) if acy.get("relative") is not None else None,
+            clip=(float(acy.get("clip")[0]), float(acy.get("clip")[1])) if isinstance(acy.get("clip"), list) and len(acy.get("clip"))==2 else (-1.0,1.0),
         )
-
-    ac = json.loads(action_cfg_path.read_text(encoding="utf-8"))
-    # Newer bundles may use 'policy_joint_order' to avoid ambiguity.
-    joint_order = list(ac.get("policy_joint_order") or ac.get("joint_order") or [])
-    action_config = ActionConfig(
-        type=ac.get("type", "joint_position"),
-        joint_order=joint_order,
-        scale=ac.get("scale"),
-        use_default_offset=ac.get("use_default_offset"),
-        clip=tuple(ac.get("clip") or [-1.0, 1.0]),
-    )
-
+        terms: list[ObservationSpec] = []
+        total_dim = int(ocy.get("total_dim") or 0)
+        for t in list(ocy.get("terms") or []):
+            if not isinstance(t, dict):
+                continue
+            params = t.get("params") if isinstance(t.get("params"), dict) else None
+            terms.append(
+                ObservationSpec(
+                    name=str(t.get("name")),
+                    func=str(t.get("func", t.get("name"))),
+                    params=dict(params) if params else None,
+                    clip=(float(t.get("clip")[0]), float(t.get("clip")[1])) if isinstance(t.get("clip"), list) and len(t.get("clip"))==2 else None,
+                    shape=[int(x) for x in list(t.get("shape") or [])] if t.get("shape") is not None else None,
+                    dim=int(t.get("dim")) if t.get("dim") is not None else None,
+                )
+            )
+        if total_dim <= 0:
+            total_dim = int(sum(int(s.dim or 0) for s in terms))
+        observation_config = ObservationConfig(
+            terms=terms,
+            total_dim=total_dim,
+            group=str(ocy.get("group", "policy")),
+            version=int(ocy.get("version", 1)),
+        )
     rif = yaml.safe_load(robot_if_path.read_text(encoding="utf-8"))
     version = int(rif.get("version", 1))
     frames = dict(rif.get("frames", {}))
@@ -84,10 +260,20 @@ def load_bundle(bundle_path: str) -> PolicyBundle:
         control=dict(rif.get("control", {})),
     )
 
-    obs_norm_path = root / "obs_normalization.json"
+    # Prefer YAML normalization; keep JSON as backwards-compatible input.
     obs_norm = None
-    if obs_norm_path.exists():
-        obs_norm = json.loads(obs_norm_path.read_text(encoding="utf-8"))
+    obs_norm_yaml = root / "obs_normalization.yaml"
+    obs_norm_json = root / "obs_normalization.json"
+    if obs_norm_yaml.exists():
+        try:
+            obs_norm = yaml.safe_load(obs_norm_yaml.read_text(encoding="utf-8"))
+        except Exception:
+            obs_norm = None
+    elif obs_norm_json.exists():
+        try:
+            obs_norm = json.loads(obs_norm_json.read_text(encoding="utf-8"))
+        except Exception:
+            obs_norm = None
 
     meta_path = root / "metadata.yaml"
     meta = None
@@ -97,8 +283,8 @@ def load_bundle(bundle_path: str) -> PolicyBundle:
     return PolicyBundle(
         root=root,
         policy_onnx=policy_onnx,
-        io_descriptor=io_desc,
-        observations=obs_specs,
+        io_descriptors=io_desc_yaml,
+        observation_config=observation_config,
         action_config=action_config,
         robot_interface=robot_interface,
         obs_normalization=obs_norm,

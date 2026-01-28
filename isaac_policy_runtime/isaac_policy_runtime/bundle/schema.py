@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 @dataclass(frozen=True)
 class ObservationSpec:
@@ -8,6 +8,16 @@ class ObservationSpec:
     func: str
     params: Dict[str, Any] | None = None
     clip: Tuple[float, float] | None = None
+    shape: List[int] | None = None
+    dim: int | None = None
+
+
+@dataclass(frozen=True)
+class ObservationConfig:
+    terms: List[ObservationSpec]
+    total_dim: int
+    group: str = "policy"
+    version: int = 1
 
 @dataclass(frozen=True)
 class ActionConfig:
@@ -15,6 +25,8 @@ class ActionConfig:
     joint_order: List[str]
     scale: float | None = None
     use_default_offset: bool | None = None
+    offset: List[float] | None = None
+    relative: bool | None = None
     clip: Tuple[float, float] = (-1.0, 1.0)
 
 @dataclass(frozen=True)

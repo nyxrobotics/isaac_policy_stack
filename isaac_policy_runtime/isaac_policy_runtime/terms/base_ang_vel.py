@@ -13,7 +13,7 @@ class BaseAngVel(TermBase):
         if msg is None:
             return np.zeros((3,), dtype=np.float32)
 
-        field = self.wiring.get("vector_field", "angular_velocity")
+        field = self.wiring.get("data_field") or self.wiring.get("vector_field", "angular_velocity")
         v = getattr(msg, field, None)
         if v is None:
             raise AttributeError(f"IMU message has no field '{field}'")

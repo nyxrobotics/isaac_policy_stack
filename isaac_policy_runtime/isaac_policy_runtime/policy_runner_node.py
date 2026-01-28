@@ -48,6 +48,10 @@ class PolicyRunner(Node):
 
         self.bundle: PolicyBundle = load_bundle(bundle_path)
 
+        # Sanity-check: observation/action configs vs io_descriptors.yaml (if available).
+        # This is ABI-critical. If mismatch is detected and strict=True, we raise.
+        self._check_io_descriptor_consistency()
+
         if ort is None:
             raise RuntimeError("onnxruntime is not installed. Install it with: pip install onnxruntime")
 
@@ -66,7 +70,7 @@ class PolicyRunner(Node):
 
         # Build term pipeline
         self.terms = []
-        for obs in self.bundle.observations:
+        for obs in self.bundle.observation_config.terms:
             TermCls = get_term_class(obs.func)
             term = TermCls(
                 node=self,
@@ -110,21 +114,155 @@ class PolicyRunner(Node):
 
         if self.log_io:
             self.get_logger().info(f"Bundle: {self.bundle.root}")
-            self.get_logger().info(
-                f"Observations terms ({len(self.bundle.observations)}): {[o.name for o in self.bundle.observations]}"
-            )
-            self.get_logger().info(
-                f"Action joints ({len(self.bundle.action_config.joint_order)}): {self.bundle.action_config.joint_order}"
-            )
+            obs_names = [o.name for o in self.bundle.observation_config.terms]
+            self.get_logger().info(f"Observation terms ({len(obs_names)}): {obs_names}")
+
+            # ---- Observation vector layout (concat order is ABI-critical)
+            cursor = 0
+            self.get_logger().info("Observation vector layout (concat order):")
+            for o in self.bundle.observation_config.terms:
+                dim = int(o.dim) if o.dim is not None else 0
+                shape = list(o.shape or [])
+
+                start_i = cursor
+                end_i = cursor + dim  # exclusive
+                self.get_logger().info(f"  [{start_i}:{end_i}) {o.name} shape={shape} dim={dim}")
+                cursor = end_i
+
+                # If this term has a meaningful element order (e.g., joints), print it.
+                p = dict(o.params or {})
+                jo = p.get("joint_order")
+                off = p.get("offsets")
+                if isinstance(jo, list) and len(jo) > 0:
+                    # Print (term-local index -> joint name [+ offset]) mapping.
+                    pairs = []
+                    for k, jn in enumerate(jo):
+                        if isinstance(off, list) and k < len(off):
+                            pairs.append(f"{k}:{jn}(offset={float(off[k]):.6g})")
+                        else:
+                            pairs.append(f"{k}:{jn}")
+                    self.get_logger().info(f"    element_order: {pairs}")
+                    self.get_logger().info(f"    relative(default)={p.get('relative', None)}")
+
+            expected = int(self.bundle.observation_config.total_dim)
+            self.get_logger().info(f"Observation total_dim: computed={cursor}, observation_config.yaml={expected}")
+
+            # ---- Action layout (policy output ABI)
+            cfg = self.bundle.action_config
+            self.get_logger().info(f"Action scale={cfg.scale}, clip={cfg.clip}, relative={cfg.relative}")
+            if isinstance(cfg.joint_order, list) and len(cfg.joint_order) > 0:
+                pairs = []
+                for k, jn in enumerate(cfg.joint_order):
+                    if isinstance(cfg.offset, list) and k < len(cfg.offset):
+                        pairs.append(f"{k}:{jn}(offset={float(cfg.offset[k]):.6g})")
+                    else:
+                        pairs.append(f"{k}:{jn}")
+                self.get_logger().info(f"Action element_order: {pairs}")
+            if isinstance(cfg.offset, list):
+                self.get_logger().info(f"Action offsets({len(cfg.offset)}): {cfg.offset}")
+
             self.get_logger().info(f"Control topic: {topic} @ rate_hz={self.rate_hz}, decimation={self.decimation}")
             if self._cmd_joint_order_ros is not None:
                 self.get_logger().info(
                     "Controller joints resolved via ROS params "
                     f"({len(self._cmd_joint_order_ros)}): {self._cmd_joint_order_ros}"
                 )
-
         period = 1.0 / self.rate_hz
         self.timer = self.create_timer(period, self._step)
+
+    def _check_io_descriptor_consistency(self) -> None:
+        """Verify that action/observation configs match io_descriptors.yaml.
+
+        This check ensures the policy ABI (term order, per-term shapes, joint orders, and offsets)
+        matches what Isaac Lab exported.
+        """
+        io = self.bundle.io_descriptors
+        if not isinstance(io, dict):
+            return
+
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        # ---- Observations
+        obs = io.get("observations")
+        policy = obs.get("policy") if isinstance(obs, dict) else None
+        if isinstance(policy, list):
+            io_names = [str(t.get("name")) for t in policy if isinstance(t, dict)]
+            cfg_names = [t.name for t in self.bundle.observation_config.terms]
+            if io_names != cfg_names:
+                errors.append(
+                    "observation term order mismatch: io_descriptors.yaml vs observation_config.yaml\n"
+                    f"  io:  {io_names}\n  cfg: {cfg_names}"
+                )
+
+            # Per-term shape + joint details
+            by_name = {t.name: t for t in self.bundle.observation_config.terms}
+            for t in policy:
+                if not isinstance(t, dict):
+                    continue
+                name = str(t.get("name"))
+                cfg = by_name.get(name)
+                if cfg is None:
+                    continue
+                shape_raw = t.get("shape")
+                if shape_raw is not None:
+                    if isinstance(shape_raw, int):
+                        io_shape = [int(shape_raw)]
+                    else:
+                        io_shape = [int(x) for x in list(shape_raw)]
+                    cfg_shape = list(cfg.shape or [])
+                    if io_shape != cfg_shape:
+                        errors.append(f"observation shape mismatch for '{name}': io={io_shape} cfg={cfg_shape}")
+
+                # Joint order + offsets are meaning-bearing.
+                if isinstance(t.get("joint_names"), list):
+                    io_joints = [str(x) for x in list(t.get("joint_names") or [])]
+                    cfg_joints = list((cfg.params or {}).get("joint_order") or [])
+                    if io_joints != cfg_joints:
+                        errors.append(
+                            f"observation joint order mismatch for '{name}': io={io_joints} cfg={cfg_joints}"
+                        )
+
+                # Offsets keys differ by term type.
+                io_off = None
+                if isinstance(t.get("joint_pos_offsets"), list):
+                    io_off = [float(x) for x in list(t.get("joint_pos_offsets") or [])]
+                if isinstance(t.get("joint_vel_offsets"), list):
+                    io_off = [float(x) for x in list(t.get("joint_vel_offsets") or [])]
+                if io_off is not None:
+                    cfg_off = (cfg.params or {}).get("offsets")
+                    cfg_off = [float(x) for x in list(cfg_off or [])] if isinstance(cfg_off, list) else []
+                    if io_off != cfg_off:
+                        errors.append(
+                            f"observation offsets mismatch for '{name}': io={io_off} cfg={cfg_off}"
+                        )
+        else:
+            warnings.append("io_descriptors.yaml has no observations.policy; skipping observation consistency check")
+
+        # ---- Actions
+        actions = io.get("actions")
+        if isinstance(actions, list) and actions and isinstance(actions[0], dict):
+            a0 = actions[0]
+            io_joints = [str(x) for x in list(a0.get("joint_names") or [])]
+            cfg_joints = list(self.bundle.action_config.joint_order or [])
+            if io_joints and io_joints != cfg_joints:
+                errors.append(f"action joint order mismatch: io={io_joints} cfg={cfg_joints}")
+
+            if isinstance(a0.get("offset"), list) and self.bundle.action_config.offset is not None:
+                io_off = [float(x) for x in list(a0.get("offset") or [])]
+                cfg_off = [float(x) for x in list(self.bundle.action_config.offset or [])]
+                if io_off != cfg_off:
+                    errors.append(f"action offsets mismatch: io={io_off} cfg={cfg_off}")
+        else:
+            warnings.append("io_descriptors.yaml has no actions[0]; skipping action consistency check")
+
+        for w in warnings:
+            self.get_logger().warning(w)
+        if errors:
+            for e in errors:
+                self.get_logger().error(e)
+            if self.strict:
+                raise RuntimeError("IO descriptor consistency check failed (strict=True).")
 
     def _step(self):
         self._tick += 1
@@ -164,7 +302,10 @@ class PolicyRunner(Node):
         scale = float(cfg.scale) if cfg.scale is not None else 1.0
         q = a * scale
 
-        if bool(cfg.use_default_offset):
+        # Apply offsets (preferred: IO_descriptors.yaml action offsets).
+        if bool(cfg.relative) and isinstance(cfg.offset, list) and len(cfg.offset) == len(cfg.joint_order):
+            q = q + np.asarray([float(x) for x in cfg.offset], dtype=np.float32)
+        elif bool(cfg.use_default_offset):
             defaults = dict((self.bundle.robot_interface.joints or {}).get("default_pos", {}) or {})
             offset = np.asarray([float(defaults.get(j, 0.0)) for j in cfg.joint_order], dtype=np.float32)
             q = q + offset
@@ -175,7 +316,7 @@ class PolicyRunner(Node):
         if self._cmd_to_policy_idx is None:
             # No controller mapping available: publish in policy order (legacy behavior).
             return q_policy
-        
+
         q_cmd = np.zeros((int(self._cmd_to_policy_idx.shape[0]),), dtype=np.float32)
         for i, pol_idx in enumerate(self._cmd_to_policy_idx.tolist()):
             if pol_idx >= 0:

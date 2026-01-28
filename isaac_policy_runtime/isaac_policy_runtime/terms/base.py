@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 from rclpy.node import Node
 
-from ..bundle.schema import ObservationSpec
-from ..bundle.schema import ActionConfig
-from ..bundle.schema import RobotInterface
+from ..bundle.schema import ActionConfig, ObservationSpec, RobotInterface
 from ..io.source_manager import SourceManager
 
 
@@ -20,7 +18,8 @@ class RuntimeState:
 class TermBase:
     """Base class for all observation terms.
 
-    A term computes one observation vector piece for the policy input.
+    A term computes one observation vector piece for the policy input. Terms are
+    concatenated in the order given by io_descriptor.json (exported from Isaac Lab).
     """
 
     def __init__(
@@ -43,21 +42,19 @@ class TermBase:
         self.use_tf = use_tf
         self.strict = strict
 
-        # Each term may declare required sources in obs_spec.term_inputs.
-        # We don't enforce it at construction time here; individual terms can.
-        self.term_inputs = getattr(obs_spec, "term_inputs", None)
-
         # Term-specific wiring from robot_interface.yaml
-        if obs_spec.name not in robot_if.term_inputs:
+        if obs_spec.name not in (robot_if.term_inputs or {}):
             raise KeyError(f"term_inputs missing for term '{obs_spec.name}'")
-        self.wiring: Dict[str, Any] = dict(robot_if.term_inputs[obs_spec.name])
 
-        # Ensure required source subscription exists
+        self.wiring: Dict[str, Any] = dict((robot_if.term_inputs or {})[obs_spec.name] or {})
         src = self.wiring.get("source")
         if not src:
             raise KeyError(f"term_inputs[{obs_spec.name}].source is required")
-        
-    
-        self.sources.ensure_source(src)
+
+        # Pseudo-source: some terms (e.g., last_action) do not require a ROS topic.
+        # Use source: "internal" in robot_interface.yaml.
+        if str(src) != "internal":
+            self.sources.ensure_source(str(src))
+
     def compute(self) -> np.ndarray:
         raise NotImplementedError

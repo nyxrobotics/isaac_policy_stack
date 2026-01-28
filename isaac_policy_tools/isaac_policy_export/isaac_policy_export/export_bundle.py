@@ -9,8 +9,8 @@
 #     - policy.pt   (optional)
 #     - IO_descriptors.yaml (optional but recommended)
 # - Auto-generates runtime ABI files from exported/IO_descriptors.yaml:
-#     - io_descriptor.json
-#     - action_config.json  (policy joint order only)
+#     - observation_config.yaml
+#     - action_config.yaml
 # - Writes robot_interface.yaml with controller_name only (NO joint order).
 #   Controller joint order is resolved at runtime via ROS2 parameters:
 #     ros2 param get <controller_name> joints
@@ -47,6 +47,11 @@ def _ensure_dir(path: Path) -> None:
 
 
 def _write_json(path: Path, data: Any, force: bool) -> None:
+    """Write JSON deterministically.
+
+    Note: this exporter is migrating to YAML-only bundles, but we keep this helper
+    for backwards-compatibility (e.g., legacy tooling).
+    """
     if path.exists() and not force:
         print(f"[SKIP] {path} exists (use --force to overwrite)")
         return
@@ -66,13 +71,37 @@ def _write_yaml(path: Path, data: Any, force: bool) -> None:
     print(f"[OK] Wrote {path}")
 
 
-def _ensure_placeholder(path: Path, force: bool, note: str) -> None:
-    if path.exists() and not force:
-        print(f"[SKIP] {path} exists (use --force to overwrite)")
+def _ensure_placeholder(path: Path, note: str) -> None:
+    """Create an empty placeholder only if the file does not exist.
+
+    IMPORTANT: Placeholders must never overwrite generated content. Even when the
+    user passes --force, they expect regenerated YAML, not empty files.
+    """
+    if path.exists():
         return
     _ensure_dir(path.parent)
     path.write_bytes(b"")
     print(f"[NOTE] Created placeholder {path} (empty). {note}")
+
+
+def _infer_term_input(term_name: str) -> dict[str, Any]:
+    """Best-effort defaults for robot_interface.yaml term_inputs.
+
+    This is a convenience generator. The user should still review topics/frames.
+    """
+    n = term_name.strip().lower()
+    if n in ("joint_pos_rel", "joint_pos"):
+        return {"source": "joint_states", "rel": True}
+    if n in ("joint_vel_rel", "joint_vel"):
+        return {"source": "joint_states", "rel": True}
+    if "imu" in n or "ang_vel" in n or "acc" in n:
+        return {"source": "imu"}
+    if "command" in n or "cmd" in n:
+        return {"source": "cmd_vel"}
+    if n in ("last_action",):
+        return {"source": "internal"}
+    # Fallback: keep deterministic but safe-ish default.
+    return {"source": "internal"}
 
 
 def _copy_file(src: Path, dst: Path, force: bool) -> None:
@@ -193,7 +222,7 @@ def _write_metadata(cfg: ExportConfig) -> None:
         "layout": {
             "exported_dir": "exported/",
             "exported_artifacts": ["policy.onnx", "policy.pt", "IO_descriptors.yaml"],
-            "runtime_abi_files": ["io_descriptor.json", "action_config.json", "obs_normalization.json"],
+            "runtime_abi_files": ["observation_config.yaml", "action_config.yaml", "obs_normalization.yaml"],
         },
         "runtime_assumptions": {
             "controller_joint_order_resolution": {
@@ -210,7 +239,7 @@ def _write_metadata(cfg: ExportConfig) -> None:
     _write_yaml(cfg.bundle_out / "metadata.yaml", metadata, force=cfg.force)
 
 
-def _write_robot_interface(cfg: ExportConfig) -> None:
+def _write_robot_interface(cfg: ExportConfig, observation_term_names: list[str] | None = None) -> None:
     if cfg.robot_interface_version != "v1":
         raise RuntimeError(f"Unsupported robot_interface_version: {cfg.robot_interface_version}")
 
@@ -237,12 +266,16 @@ def _write_robot_interface(cfg: ExportConfig) -> None:
             "node": cfg.controller_name,
             "param": "joints",
         },
-        # Policy joint order comes from action_config.json (generated from IO_descriptors.yaml)
-        "policy_joint_order_source": "action_config.json",
+        # Policy joint order comes from action_config.yaml (generated from IO_descriptors.yaml)
+        "policy_joint_order_source": "action_config.yaml",
     }
 
-    # term_inputs intentionally left skeletal; wiring is robot-specific and should be edited.
+    # term_inputs: auto-fill representative entries if we know the observation term list.
     data.setdefault("term_inputs", {})
+    if observation_term_names:
+        for tn in observation_term_names:
+            if tn not in data["term_inputs"]:
+                data["term_inputs"][tn] = _infer_term_input(tn)
 
     _write_yaml(cfg.bundle_out / "robot_interface.yaml", data, force=cfg.force)
 
@@ -274,86 +307,130 @@ def _copy_exported_artifacts(cfg: ExportConfig) -> None:
     io_src = src_dir / "IO_descriptors.yaml"
     if io_src.exists() and io_src.is_file():
         _copy_file(io_src, dst_dir / "IO_descriptors.yaml", force=cfg.force)
+        # Also store a lowercase copy at bundle root for convenience/consistency.
+        _copy_file(io_src, cfg.bundle_out / "io_descriptors.yaml", force=cfg.force)
     else:
         print(f"[WARN] {io_src} not found, skipping")
 
 
-def _generate_runtime_abi_from_io_descriptors(cfg: ExportConfig) -> None:
+
+def _generate_runtime_configs_from_io_descriptors(cfg: ExportConfig) -> None:
     io_yaml = cfg.bundle_out / "exported" / "IO_descriptors.yaml"
     if not io_yaml.exists():
-        print(f"[WARN] {io_yaml} not found. Cannot auto-generate io_descriptor.json/action_config.json.")
+        print(f"[WARN] {io_yaml} not found. Cannot auto-generate observation_config.yaml/action_config.yaml.")
         return
 
     with io_yaml.open("r", encoding="utf-8") as f:
         io = yaml.safe_load(f)
 
-    # ---- Observations (policy group)
+    # ---- Observations (policy group) -> observation_config.yaml
     obs_terms = io.get("observations", {}).get("policy", None)
     if not isinstance(obs_terms, list) or len(obs_terms) == 0:
         raise RuntimeError("IO_descriptors.yaml does not contain a non-empty observations.policy list")
 
-    # Isaac Lab term names -> runtime ABI term names
-    name_map = {
-        "generated_commands": "velocity_commands",
-        "joint_pos_rel": "joint_pos",
-        "joint_vel_rel": "joint_vel",
-        "last_action": "actions",
-    }
-
-    out_obs: list[dict[str, Any]] = []
+    out_terms: list[dict[str, Any]] = []
     total_dim = 0
     for term in obs_terms:
-        src_name = term.get("name")
-        shape = term.get("shape")
-        if src_name is None or shape is None:
+        if not isinstance(term, dict):
             raise RuntimeError(f"Invalid observation term entry: {term}")
+        name = str(term.get("name"))
+        shape_raw = term.get("shape")
+        if shape_raw is None:
+            raise RuntimeError(f"Invalid observation term entry (missing shape): {term}")
 
-        dst_name = name_map.get(str(src_name), str(src_name))
-
-        if isinstance(shape, int):
-            shape_list = [int(shape)]
+        if isinstance(shape_raw, int):
+            shape = [int(shape_raw)]
         else:
-            shape_list = [int(x) for x in list(shape)]
+            shape = [int(x) for x in list(shape_raw)]
 
         dim = 1
-        for s in shape_list:
+        for s in shape:
             dim *= int(s)
-        total_dim += dim
+        total_dim += int(dim)
 
-        out_obs.append({"name": dst_name, "shape": shape_list})
+        params: dict[str, Any] = {}
+        if isinstance(term.get("joint_names"), list):
+            params["joint_order"] = [str(x) for x in list(term.get("joint_names") or [])]
+        if isinstance(term.get("joint_pos_offsets"), list):
+            params["offsets"] = [float(x) for x in list(term.get("joint_pos_offsets") or [])]
+        if isinstance(term.get("joint_vel_offsets"), list):
+            params["offsets"] = [float(x) for x in list(term.get("joint_vel_offsets") or [])]
+        if params:
+            params.setdefault("relative", True)
 
-    io_desc = {
+        out_terms.append(
+            {
+                "name": name,
+                "func": name,
+                "shape": shape,
+                "dim": int(dim),
+                "clip": None,
+                "params": params if params else None,
+            }
+        )
+
+    obs_cfg = {
         "version": 1,
-        "observation_group": "policy",
-        "observations": out_obs,
+        "group": "policy",
         "total_dim": int(total_dim),
+        "terms": out_terms,
         "source": {"type": "isaaclab", "file": "exported/IO_descriptors.yaml"},
-        "name_map": name_map,
     }
-    _write_json(cfg.bundle_out / "io_descriptor.json", io_desc, force=cfg.force)
+    _write_yaml(cfg.bundle_out / "observation_config.yaml", obs_cfg, force=cfg.force)
 
     # ---- Actions: policy joint order only (NOT controller order)
     actions = io.get("actions", None)
     joint_names: Optional[list[str]] = None
+    a0: Optional[dict[str, Any]] = None
     if isinstance(actions, list) and len(actions) > 0 and isinstance(actions[0], dict):
-        j = actions[0].get("joint_names", None)
+        a0 = actions[0]
+        j = a0.get("joint_names", None)
         if isinstance(j, list) and len(j) > 0:
             joint_names = [str(x) for x in j]
 
-    if joint_names is None:
-        print("[WARN] Could not find actions[0].joint_names in IO_descriptors.yaml; skipping action_config.json generation.")
+    if joint_names is None or a0 is None:
+        print("[WARN] Could not find actions[0].joint_names in IO_descriptors.yaml; skipping action_config.yaml generation.")
         return
+
+    offsets = None
+    try:
+        if isinstance(a0.get("offset"), list):
+            offsets = [float(x) for x in (a0.get("offset") or [])]
+    except Exception:
+        offsets = None
 
     action_cfg = {
         "type": "joint_position",
         # This is POLICY joint order (ABI). Runtime remaps to controller joints at runtime.
-        "policy_joint_order": joint_names,
-        "scale": float(cfg.action_scale),
+        "joint_order": joint_names,
+        "scale": float(a0.get("scale")) if a0.get("scale") is not None else float(cfg.action_scale),
+        # Prefer explicit offsets from IO_descriptors.yaml in runtime. Keep default_pos fallback optional.
         "use_default_offset": bool(cfg.action_use_default_offset),
-        "clip": None,
+        "offset": offsets,
+        # Default: actions are relative to offsets (i.e., q = offset + scale * a).
+        "relative": True,
+        "clip": list(a0.get("clip")) if isinstance(a0.get("clip"), list) else [-1.0, 1.0],
         "source": {"type": "isaaclab", "file": "exported/IO_descriptors.yaml"},
     }
-    _write_json(cfg.bundle_out / "action_config.json", action_cfg, force=cfg.force)
+    _write_yaml(cfg.bundle_out / "action_config.yaml", action_cfg, force=cfg.force)
+
+
+def _load_observation_term_names_from_io(cfg: ExportConfig) -> list[str] | None:
+    io_yaml = cfg.bundle_out / "exported" / "IO_descriptors.yaml"
+    if not io_yaml.exists():
+        return None
+    try:
+        io = yaml.safe_load(io_yaml.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    obs_terms = (io.get("observations") or {}).get("policy") if isinstance(io, dict) else None
+    if not isinstance(obs_terms, list):
+        return None
+    names = []
+    for t in obs_terms:
+        if isinstance(t, dict) and t.get("name") is not None:
+            names.append(str(t.get("name")))
+    return names if names else None
 
 
 def _write_placeholders_if_needed(cfg: ExportConfig) -> None:
@@ -362,36 +439,32 @@ def _write_placeholders_if_needed(cfg: ExportConfig) -> None:
     if cfg.exported_dir is None:
         _ensure_placeholder(
             cfg.bundle_out / "exported" / "policy.onnx",
-            force=cfg.force,
             note="Replace with real content (from Isaac Lab exported/).",
         )
         _ensure_placeholder(
             cfg.bundle_out / "exported" / "policy.pt",
-            force=cfg.force,
             note="Optional. Replace with real content (from Isaac Lab exported/).",
         )
         _ensure_placeholder(
             cfg.bundle_out / "exported" / "IO_descriptors.yaml",
-            force=cfg.force,
             note="Optional but recommended. Copy from Isaac Lab exported/.",
         )
-
-    if not (cfg.bundle_out / "io_descriptor.json").exists():
-        _ensure_placeholder(
-            cfg.bundle_out / "io_descriptor.json",
-            force=cfg.force,
-            note="Replace or auto-generate from exported/IO_descriptors.yaml.",
-        )
-    if not (cfg.bundle_out / "action_config.json").exists():
-        _ensure_placeholder(
-            cfg.bundle_out / "action_config.json",
-            force=cfg.force,
-            note="Replace or auto-generate from exported/IO_descriptors.yaml.",
-        )
+    _ensure_placeholder(
+        cfg.bundle_out / "io_descriptors.yaml",
+        note="Optional but recommended. Copy from Isaac Lab exported/IO_descriptors.yaml.",
+    )
 
     _ensure_placeholder(
-        cfg.bundle_out / "obs_normalization.json",
-        force=cfg.force,
+        cfg.bundle_out / "action_config.yaml",
+        note="Replace or auto-generate from exported/IO_descriptors.yaml.",
+    )
+    _ensure_placeholder(
+        cfg.bundle_out / "observation_config.yaml",
+        note="Replace or auto-generate from exported/IO_descriptors.yaml.",
+    )
+
+    _ensure_placeholder(
+        cfg.bundle_out / "obs_normalization.yaml",
         note="Optional. Replace with mean/std if you use observation normalization.",
     )
 
@@ -421,17 +494,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     _ensure_dir(cfg.bundle_out)
 
-    # 1) Always write skeleton files
-    _write_robot_interface(cfg)
-    _write_metadata(cfg)
-
-    # 2) Copy Isaac Lab artifacts into bundle/exported/
+    # 1) Copy Isaac Lab artifacts into bundle/exported/
     _copy_exported_artifacts(cfg)
 
-    # 3) Generate runtime ABI from bundle/exported/IO_descriptors.yaml
-    _generate_runtime_abi_from_io_descriptors(cfg)
+    # 2) Generate runtime ABI from bundle/exported/IO_descriptors.yaml
+    _generate_runtime_configs_from_io_descriptors(cfg)
 
-    # 4) Fill any missing files with placeholders
+    # 3) Robot interface + metadata (term_inputs can be auto-filled if IO is present)
+    obs_term_names = _load_observation_term_names_from_io(cfg)
+    _write_robot_interface(cfg, observation_term_names=obs_term_names)
+    _write_metadata(cfg)
+
+    # 4) Fill any missing files with placeholders (never overwrite generated files)
     _write_placeholders_if_needed(cfg)
 
     return 0
