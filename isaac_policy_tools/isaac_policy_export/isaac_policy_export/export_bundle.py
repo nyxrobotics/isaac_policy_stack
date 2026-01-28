@@ -87,19 +87,62 @@ def _ensure_placeholder(path: Path, note: str) -> None:
 def _infer_term_input(term_name: str) -> dict[str, Any]:
     """Best-effort defaults for robot_interface.yaml term_inputs.
 
-    This is a convenience generator. The user should still review topics/frames.
+    The goal is to make the generated robot_interface.yaml immediately usable by
+    the runtime by specifying *which ROS message fields* to extract.
+
+    Conventions:
+    - JointState-derived terms MUST specify:
+        - name_field: usually "name"
+        - data_field: "position" or "velocity"
+      Runtime will reorder values by matching JointState.<name_field>[] to the
+      policy joint order in observation_config.yaml / io_descriptors.yaml.
+    - IMU-derived terms specify data_field ("angular_velocity" / "linear_acceleration").
+    - cmd_vel (Twist) terms specify an ordered list of scalar fields.
     """
     n = term_name.strip().lower()
+
+    # ---- JointState (sensor_msgs/JointState) ----
     if n in ("joint_pos_rel", "joint_pos"):
-        return {"source": "joint_states", "rel": True}
+        out: dict[str, Any] = {
+            "source": "joint_states",
+            "name_field": "name",
+            "data_field": "position",
+        }
+        # Many pipelines treat joint positions as relative by default.
+        out["rel"] = True
+        return out
+
     if n in ("joint_vel_rel", "joint_vel"):
-        return {"source": "joint_states", "rel": True}
-    if "imu" in n or "ang_vel" in n or "acc" in n:
-        return {"source": "imu"}
-    if "command" in n or "cmd" in n:
-        return {"source": "cmd_vel"}
+        out = {
+            "source": "joint_states",
+            "name_field": "name",
+            "data_field": "velocity",
+        }
+        if n.endswith("_rel"):
+            out["rel"] = True
+        return out
+
+    # ---- IMU (sensor_msgs/Imu) ----
+    if n in ("base_ang_vel", "base_ang_vel_rel", "ang_vel", "angular_velocity"):
+        return {"source": "imu", "data_field": "angular_velocity"}
+
+    if n in ("base_lin_acc_sens", "base_lin_acc", "lin_acc", "linear_acceleration"):
+        return {"source": "imu", "data_field": "linear_acceleration"}
+
+    # ---- Command (geometry_msgs/Twist) ----
+    if n in ("generated_commands", "cmd_vel", "commands"):
+        return {
+            "source": "cmd_vel",
+            "data_field": ["linear.x", "linear.y", "angular.z"],
+        }
+
+    # Common policy terms that are internal to the runtime
     if n in ("last_action",):
         return {"source": "internal"}
+
+    # Fallback: keep deterministic but safe-ish default.
+    return {"source": "internal"}
+
     # Fallback: keep deterministic but safe-ish default.
     return {"source": "internal"}
 
