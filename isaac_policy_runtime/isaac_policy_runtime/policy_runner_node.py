@@ -162,6 +162,12 @@ class PolicyRunner(Node):
                 self.get_logger().info(f"Action offsets({len(cfg.offset)}): {cfg.offset}")
 
             self.get_logger().info(f"Control topic: {topic} @ rate_hz={self.rate_hz}, decimation={self.decimation}")
+            ctrl_rel = (self.bundle.robot_interface.control or {}).get("rel", None)
+            if ctrl_rel is None:
+                ctrl_rel = True
+            self.get_logger().info(
+                f"Control rel={bool(ctrl_rel)}: apply action_config offsets={'enabled' if bool(ctrl_rel) else 'disabled'}"
+            )
             if self._cmd_joint_order_ros is not None:
                 self.get_logger().info(
                     "Controller joints resolved via ROS params "
@@ -302,28 +308,41 @@ class PolicyRunner(Node):
         scale = float(cfg.scale) if cfg.scale is not None else 1.0
         q = a * scale
 
-        # Apply offsets (preferred: IO_descriptors.yaml action offsets).
-        if bool(cfg.relative) and isinstance(cfg.offset, list) and len(cfg.offset) == len(cfg.joint_order):
-            q = q + np.asarray([float(x) for x in cfg.offset], dtype=np.float32)
-        elif bool(cfg.use_default_offset):
-            defaults = dict((self.bundle.robot_interface.joints or {}).get("default_pos", {}) or {})
-            offset = np.asarray([float(defaults.get(j, 0.0)) for j in cfg.joint_order], dtype=np.float32)
-            q = q + offset
+        # Apply action offsets.
+        #
+        # The offset values live in action_config.yaml (exported from IO_descriptors.yaml).
+        # robot_interface.yaml only toggles whether they are applied, via control.rel.
+        ctrl = self.bundle.robot_interface.control or {}
+        ctrl_rel = ctrl.get("rel", None)
+        if ctrl_rel is None:
+            # Default to True to match Isaac Lab's relative-action convention.
+            ctrl_rel = True
+
+        if bool(ctrl_rel):
+            if isinstance(cfg.offset, list) and len(cfg.offset) == len(cfg.joint_order):
+                q = q + np.asarray([float(x) for x in cfg.offset], dtype=np.float32)
+            elif bool(cfg.use_default_offset):
+                defaults = dict((self.bundle.robot_interface.joints or {}).get("default_pos", {}) or {})
+                offset = np.asarray([float(defaults.get(j, 0.0)) for j in cfg.joint_order], dtype=np.float32)
+                q = q + offset
 
         q_policy = q.astype(np.float32, copy=False)
 
         # Remap policy joint order -> controller command joint order (resolved at runtime).
         if self._cmd_to_policy_idx is None:
             # No controller mapping available: publish in policy order (legacy behavior).
-            return q_policy
+            q_cmd = q_policy
+            cmd_joint_names: list[str] | None = None
+        else:
+            q_cmd = np.zeros((int(self._cmd_to_policy_idx.shape[0]),), dtype=np.float32)
+            for i, pol_idx in enumerate(self._cmd_to_policy_idx.tolist()):
+                if pol_idx >= 0:
+                    q_cmd[i] = float(q_policy[int(pol_idx)])
+                else:
+                    # Controller joint not part of policy DOFs (e.g., unactuated). Keep zero.
+                    q_cmd[i] = 0.0
+            cmd_joint_names = list(self._cmd_joint_order_ros or []) if getattr(self, "_cmd_joint_order_ros", None) else None
 
-        q_cmd = np.zeros((int(self._cmd_to_policy_idx.shape[0]),), dtype=np.float32)
-        for i, pol_idx in enumerate(self._cmd_to_policy_idx.tolist()):
-            if pol_idx >= 0:
-                q_cmd[i] = float(q_policy[int(pol_idx)])
-            else:
-                # Controller joint not part of policy DOFs (e.g., unactuated). Keep zero.
-                q_cmd[i] = 0.0
         return q_cmd
 
     def _get_remote_string_array_param(

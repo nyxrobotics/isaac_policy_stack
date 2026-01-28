@@ -302,6 +302,9 @@ def _write_robot_interface(cfg: ExportConfig, observation_term_names: list[str] 
         "command_topic": cfg.command_topic,
         "command_msg_type": cfg.command_msg_type,
         "rate_hz": 50,
+        # Whether to apply action_config.yaml offsets (relative action convention).
+        # Set False if your controller expects absolute positions directly from the policy.
+        "rel": True,
         # Explicitly state: order is resolved at runtime via ROS params
         "command_joint_order": None,
         "command_joint_order_resolution": {
