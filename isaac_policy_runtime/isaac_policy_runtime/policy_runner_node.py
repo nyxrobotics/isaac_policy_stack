@@ -108,8 +108,8 @@ class PolicyRunner(Node):
         self._cmd_to_policy_idx: np.ndarray | None = None
         self._resolve_command_joint_order_and_map()
 
+        # Drive policy inference and command publish strictly by dt (= 1 / rate_hz).
         self.rate_hz = float(ctrl.get("rate_hz", 200.0))
-        self.decimation = int(ctrl.get("decimation", 4))
         self._tick = 0
 
         if self.log_io:
@@ -161,7 +161,7 @@ class PolicyRunner(Node):
             if isinstance(cfg.offset, list):
                 self.get_logger().info(f"Action offsets({len(cfg.offset)}): {cfg.offset}")
 
-            self.get_logger().info(f"Control topic: {topic} @ rate_hz={self.rate_hz}, decimation={self.decimation}")
+            self.get_logger().info(f"Control topic: {topic} @ rate_hz={self.rate_hz}")
             ctrl_rel = (self.bundle.robot_interface.control or {}).get("rel", None)
             if ctrl_rel is None:
                 ctrl_rel = True
@@ -272,8 +272,6 @@ class PolicyRunner(Node):
 
     def _step(self):
         self._tick += 1
-        if (self._tick % self.decimation) != 0:
-            return
 
         obs_parts: List[np.ndarray] = []
         for t in self.terms:

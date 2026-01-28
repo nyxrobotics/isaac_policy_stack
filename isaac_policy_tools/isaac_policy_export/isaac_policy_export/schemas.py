@@ -28,16 +28,8 @@ def robot_interface_v1_skeleton(base_frame: str = "base") -> Dict[str, Any]:
             "mode": "position_targets",
             "topic": "/joint_group_pos_controller/commands",
             "rate_hz": 200,
-            "decimation": 4,
-            # Default: both action and joint-state observations are treated as "relative" (add/subtract offsets).
-            "action_relative": True,
-            "observation_relative": True,
-
-            # Optional: apply controller-side offsets after mapping the policy output into controller joint order.
-            # When enabled, offsets can be provided as either:
-            # - offsets: [..]  # list aligned with the controller joint order
-            # - offsets: {joint_name: value, ...}
-            "rel": False,
-            # "offsets": {},
+            # Toggle whether to apply the action offsets from action_config.yaml.
+            # Default True to match Isaac Lab's relative-action convention.
+            "rel": True,
         },
     }
