@@ -331,6 +331,7 @@ class PolicyRunner(Node):
             # No controller mapping available: publish in policy order (legacy behavior).
             q_cmd = q_policy
             cmd_joint_names: list[str] | None = None
+            self.get_logger().warning("No controller joint order mapping available. Publishing in policy joint order.")
         else:
             q_cmd = np.zeros((int(self._cmd_to_policy_idx.shape[0]),), dtype=np.float32)
             for i, pol_idx in enumerate(self._cmd_to_policy_idx.tolist()):
