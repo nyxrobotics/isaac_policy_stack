@@ -92,7 +92,7 @@ kuroko_walk/
   policy.onnx
   policy.pt
   robot_interface.yaml
-  metadata.yaml
+  
   io_descriptor.json          (placeholder)
   action_config.json          (placeholder)
   obs_normalization.json      (placeholder)
@@ -146,7 +146,7 @@ You are expected to **edit this file** to match:
 
 ---
 
-### metadata.yaml
+### 
 
 Contains bundle-level metadata:
 

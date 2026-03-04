@@ -196,7 +196,7 @@ def load_bundle(bundle_path: str) -> PolicyBundle:
 
     # Prefer YAML normalization; keep JSON as backwards-compatible input.
     obs_norm = None
-    obs_norm_yaml = root / "obs_normalization.yaml"
+    obs_norm_yaml = root / ""
     obs_norm_json = root / "obs_normalization.json"
     if obs_norm_yaml.exists():
         try:
@@ -209,7 +209,7 @@ def load_bundle(bundle_path: str) -> PolicyBundle:
         except Exception:
             obs_norm = None
 
-    meta_path = root / "metadata.yaml"
+    meta_path = root / ""
     meta = None
     if meta_path.exists():
         meta = yaml.safe_load(meta_path.read_text(encoding="utf-8"))

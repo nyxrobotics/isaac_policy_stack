@@ -264,7 +264,7 @@ def _write_metadata(cfg: ExportConfig) -> None:
         "layout": {
             "exported_dir": "exported/",
             "exported_artifacts": ["policy.onnx", "policy.pt", "IO_descriptors.yaml"],
-            "runtime_abi_files": ["obs_normalization.yaml"],
+            "runtime_abi_files": [""],
         },
         "runtime_assumptions": {
             "controller_joint_order_resolution": {
@@ -278,7 +278,7 @@ def _write_metadata(cfg: ExportConfig) -> None:
             },
         },
     }
-    _write_yaml(cfg.bundle_out / "metadata.yaml", metadata, force=cfg.force)
+    _write_yaml(cfg.bundle_out / "", metadata, force=cfg.force)
 
 
 def _write_robot_interface(cfg: ExportConfig, observation_term_names: list[str] | None = None) -> None:
@@ -407,7 +407,7 @@ def _write_placeholders_if_needed(cfg: ExportConfig) -> None:
     )
 
     _ensure_placeholder(
-        cfg.bundle_out / "obs_normalization.yaml",
+        cfg.bundle_out / "",
         note="Optional. Replace with mean/std if you use observation normalization.",
     )
 

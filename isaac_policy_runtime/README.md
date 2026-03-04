@@ -13,7 +13,7 @@ the bundle's `robot_interface.yaml`.
    - `io_descriptor.json`
    - `action_config.json`
    - `robot_interface.yaml`
-   - optional: `obs_normalization.json`, `metadata.yaml`
+   - optional: `obs_normalization.json`, ``
 2. Subscribes to ROS sources declared in `robot_interface.yaml` (IMU, joint states, cmd_vel, ...).
 3. Builds the observation vector **in the exact order** specified by `io_descriptor.json`.
 4. Runs ONNX inference (via `onnxruntime`).
