@@ -37,11 +37,15 @@ class PolicyRunner(Node):
         self.declare_parameter("use_tf", True)
         self.declare_parameter("strict", True)
         self.declare_parameter("log_io", True)
+        self.declare_parameter("log_every", 50)
 
         bundle_path = str(self.get_parameter("bundle_path").value)
         self.use_tf = bool(self.get_parameter("use_tf").value)
         self.strict = bool(self.get_parameter("strict").value)
         self.log_io = bool(self.get_parameter("log_io").value)
+        self.log_every = int(self.get_parameter("log_every").value)
+        if self.log_every <= 0:
+            self.log_every = 1
 
         if not bundle_path:
             raise RuntimeError("Parameter 'bundle_path' is required")
