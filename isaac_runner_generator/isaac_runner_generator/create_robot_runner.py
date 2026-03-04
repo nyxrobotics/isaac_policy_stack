@@ -210,10 +210,9 @@ class {Robot}ObservationsBridge(Node):
         R = quat_to_rotmat(q.x, q.y, q.z, q.w)
 
         # NOTE: adjust if your IMU frame differs
-        v = R @ np.array([0.0, 0.0, -1.0], dtype=np.float32)
-        n = float(np.linalg.norm(v))
-        if n > 1e-6:
-            self.projected_gravity[:] = v / n * 9.8
+        # R is a rotation matrix, so R @ [0, 0, -1] is guaranteed to have norm 1.
+        # Therefore, explicit normalization is unnecessary.
+        self.projected_gravity[:] = (-R[:, 2]) * 9.8
 
     def _cb_cmd_vel(self, msg: Twist) -> None:
         self.generated_commands[:] = [msg.linear.x, msg.linear.y, msg.angular.z]
