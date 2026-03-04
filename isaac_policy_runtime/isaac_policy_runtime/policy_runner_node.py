@@ -149,7 +149,7 @@ class PolicyRunner(Node):
                     self.get_logger().info(f"    relative(default)={p.get('relative', None)}")
 
             expected = int(self.bundle.observation_config.total_dim)
-            self.get_logger().info(f"Observation total_dim: computed={cursor}, observation_config.yaml={expected}")
+            self.get_logger().info(f"Observation total_dim: computed={cursor}, expected={expected}")
 
             # ---- Action layout (policy output ABI)
             cfg = self.bundle.action_config
@@ -170,7 +170,7 @@ class PolicyRunner(Node):
             if ctrl_rel is None:
                 ctrl_rel = True
             self.get_logger().info(
-                f"Control rel={bool(ctrl_rel)}: apply action_config offsets={'enabled' if bool(ctrl_rel) else 'disabled'}"
+                f"Control rel={bool(ctrl_rel)}: apply action offsets from IO_descriptors.yaml={'enabled' if bool(ctrl_rel) else 'disabled'}"
             )
             if self._cmd_joint_order_ros is not None:
                 self.get_logger().info(
@@ -181,7 +181,7 @@ class PolicyRunner(Node):
         self.timer = self.create_timer(period, self._step)
 
     def _check_io_descriptor_consistency(self) -> None:
-        """Verify that action/observation configs match io_descriptors.yaml.
+        """Verify that the derived ABI is consistent with io_descriptors.yaml.
 
         This check ensures the policy ABI (term order, per-term shapes, joint orders, and offsets)
         matches what Isaac Lab exported.
@@ -201,7 +201,7 @@ class PolicyRunner(Node):
             cfg_names = [t.name for t in self.bundle.observation_config.terms]
             if io_names != cfg_names:
                 errors.append(
-                    "observation term order mismatch: io_descriptors.yaml vs observation_config.yaml\n"
+                    "observation term order mismatch: io_descriptors.yaml vs derived config\n"
                     f"  io:  {io_names}\n  cfg: {cfg_names}"
                 )
 
@@ -312,7 +312,7 @@ class PolicyRunner(Node):
 
         # Apply action offsets.
         #
-        # The offset values live in action_config.yaml (exported from IO_descriptors.yaml).
+        # Offsets are taken from IO_descriptors.yaml (bundle.action_config is derived from it).
         # robot_interface.yaml only toggles whether they are applied, via control.rel.
         ctrl = self.bundle.robot_interface.control or {}
         ctrl_rel = ctrl.get("rel", None)

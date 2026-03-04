@@ -71,28 +71,6 @@ def _find_obs_term(ioy: dict[str, Any], name: str) -> dict[str, Any] | None:
     return None
 
 
-def _load_action_config_yaml(root: Path) -> dict[str, Any] | None:
-    p = root / "action_config.yaml"
-    if not p.exists():
-        return None
-    try:
-        data = yaml.safe_load(p.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
-def _load_observation_config_yaml(root: Path) -> dict[str, Any] | None:
-    p = root / "observation_config.yaml"
-    if not p.exists():
-        return None
-    try:
-        data = yaml.safe_load(p.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
 def _build_configs_from_io_descriptors(ioy: dict[str, Any], default_action_use_default_offset: bool = True) -> tuple[ActionConfig, ObservationConfig]:
     # ---- Actions
     actions_list = ioy.get("actions") if isinstance(ioy, dict) else None
@@ -185,8 +163,6 @@ def load_bundle(bundle_path: str) -> PolicyBundle:
     if not policy_onnx.exists():
         policy_onnx = root / "policy.onnx"
 
-    action_cfg_path = root / "action_config.yaml"
-    obs_cfg_path = root / "observation_config.yaml"
     robot_if_path = root / "robot_interface.yaml"
 
     _require(policy_onnx)
@@ -195,55 +171,13 @@ def load_bundle(bundle_path: str) -> PolicyBundle:
 
     io_desc_yaml = _load_io_descriptors_yaml(root)
 
-    # Load YAML configs if available; otherwise build from io_descriptors.yaml.
-    acy = _load_action_config_yaml(root)
-    ocy = _load_observation_config_yaml(root)
+    # New design: IO_descriptors.yaml is the single source of truth for the ABI.
+    if io_desc_yaml is None:
+        raise FileNotFoundError(
+            "Missing IO_descriptors.yaml in the bundle. Provide one of: io_descriptors.yaml, exported/IO_descriptors.yaml, or IO_descriptors.yaml."
+        )
 
-    if acy is None or ocy is None:
-        if io_desc_yaml is None:
-            missing = []
-            if acy is None:
-                missing.append("action_config.yaml")
-            if ocy is None:
-                missing.append("observation_config.yaml")
-            raise FileNotFoundError(
-                f"Missing {', '.join(missing)} and no io_descriptors.yaml found to derive them"
-            )
-        action_config, observation_config = _build_configs_from_io_descriptors(io_desc_yaml)
-    else:
-        action_config = ActionConfig(
-            type=str(acy.get("type", "joint_position")),
-            joint_order=[str(x) for x in list(acy.get("joint_order") or acy.get("policy_joint_order") or [])],
-            scale=float(acy["scale"]) if acy.get("scale") is not None else None,
-            use_default_offset=bool(acy.get("use_default_offset")) if acy.get("use_default_offset") is not None else None,
-            offset=[float(x) for x in list(acy.get("offset") or [])] if isinstance(acy.get("offset"), list) else None,
-            relative=bool(acy.get("relative")) if acy.get("relative") is not None else None,
-            clip=(float(acy.get("clip")[0]), float(acy.get("clip")[1])) if isinstance(acy.get("clip"), list) and len(acy.get("clip"))==2 else (-1.0,1.0),
-        )
-        terms: list[ObservationSpec] = []
-        total_dim = int(ocy.get("total_dim") or 0)
-        for t in list(ocy.get("terms") or []):
-            if not isinstance(t, dict):
-                continue
-            params = t.get("params") if isinstance(t.get("params"), dict) else None
-            terms.append(
-                ObservationSpec(
-                    name=str(t.get("name")),
-                    func=str(t.get("func", t.get("name"))),
-                    params=dict(params) if params else None,
-                    clip=(float(t.get("clip")[0]), float(t.get("clip")[1])) if isinstance(t.get("clip"), list) and len(t.get("clip"))==2 else None,
-                    shape=[int(x) for x in list(t.get("shape") or [])] if t.get("shape") is not None else None,
-                    dim=int(t.get("dim")) if t.get("dim") is not None else None,
-                )
-            )
-        if total_dim <= 0:
-            total_dim = int(sum(int(s.dim or 0) for s in terms))
-        observation_config = ObservationConfig(
-            terms=terms,
-            total_dim=total_dim,
-            group=str(ocy.get("group", "policy")),
-            version=int(ocy.get("version", 1)),
-        )
+    action_config, observation_config = _build_configs_from_io_descriptors(io_desc_yaml)
     rif = yaml.safe_load(robot_if_path.read_text(encoding="utf-8"))
     version = int(rif.get("version", 1))
     frames = dict(rif.get("frames", {}))

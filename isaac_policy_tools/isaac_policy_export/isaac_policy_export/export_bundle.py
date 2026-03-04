@@ -8,9 +8,8 @@
 #     - policy.onnx (required when --exported_dir is used)
 #     - policy.pt   (optional)
 #     - IO_descriptors.yaml (optional but recommended)
-# - Auto-generates runtime ABI files from exported/IO_descriptors.yaml:
-#     - observation_config.yaml
-#     - action_config.yaml
+# - Runtime derives the policy ABI from IO_descriptors.yaml directly.
+#   This exporter does NOT generate observation_config.yaml / action_config.yaml.
 # - Writes robot_interface.yaml with controller_name only (NO joint order).
 #   Controller joint order is resolved at runtime via ROS2 parameters:
 #     ros2 param get <controller_name> joints
@@ -95,7 +94,7 @@ def _infer_term_input(term_name: str) -> dict[str, Any]:
         - name_field: usually "name"
         - data_field: "position" or "velocity"
       Runtime will reorder values by matching JointState.<name_field>[] to the
-      policy joint order in observation_config.yaml / io_descriptors.yaml.
+      policy joint order in io_descriptors.yaml.
     - IMU-derived terms specify data_field ("angular_velocity" / "linear_acceleration").
     - cmd_vel (Twist) terms specify an ordered list of scalar fields.
     """
@@ -265,7 +264,7 @@ def _write_metadata(cfg: ExportConfig) -> None:
         "layout": {
             "exported_dir": "exported/",
             "exported_artifacts": ["policy.onnx", "policy.pt", "IO_descriptors.yaml"],
-            "runtime_abi_files": ["observation_config.yaml", "action_config.yaml", "obs_normalization.yaml"],
+            "runtime_abi_files": ["obs_normalization.yaml"],
         },
         "runtime_assumptions": {
             "controller_joint_order_resolution": {
@@ -302,7 +301,7 @@ def _write_robot_interface(cfg: ExportConfig, observation_term_names: list[str] 
         "command_topic": cfg.command_topic,
         "command_msg_type": cfg.command_msg_type,
         "rate_hz": 50,
-        # Whether to apply action_config.yaml offsets (relative action convention).
+        # Whether to apply IO_descriptors.yaml offsets (relative action convention).
         # Set False if your controller expects absolute positions directly from the policy.
         "rel": True,
         # Explicitly state: order is resolved at runtime via ROS params
@@ -312,8 +311,7 @@ def _write_robot_interface(cfg: ExportConfig, observation_term_names: list[str] 
             "node": cfg.controller_name,
             "param": "joints",
         },
-        # Policy joint order comes from action_config.yaml (generated from IO_descriptors.yaml)
-        "policy_joint_order_source": "action_config.yaml",
+        # Policy joint order comes from IO_descriptors.yaml.
     }
 
     # term_inputs: auto-fill representative entries if we know the observation term list.
@@ -361,104 +359,12 @@ def _copy_exported_artifacts(cfg: ExportConfig) -> None:
 
 
 def _generate_runtime_configs_from_io_descriptors(cfg: ExportConfig) -> None:
-    io_yaml = cfg.bundle_out / "exported" / "IO_descriptors.yaml"
-    if not io_yaml.exists():
-        print(f"[WARN] {io_yaml} not found. Cannot auto-generate observation_config.yaml/action_config.yaml.")
-        return
+    """Deprecated.
 
-    with io_yaml.open("r", encoding="utf-8") as f:
-        io = yaml.safe_load(f)
-
-    # ---- Observations (policy group) -> observation_config.yaml
-    obs_terms = io.get("observations", {}).get("policy", None)
-    if not isinstance(obs_terms, list) or len(obs_terms) == 0:
-        raise RuntimeError("IO_descriptors.yaml does not contain a non-empty observations.policy list")
-
-    out_terms: list[dict[str, Any]] = []
-    total_dim = 0
-    for term in obs_terms:
-        if not isinstance(term, dict):
-            raise RuntimeError(f"Invalid observation term entry: {term}")
-        name = str(term.get("name"))
-        shape_raw = term.get("shape")
-        if shape_raw is None:
-            raise RuntimeError(f"Invalid observation term entry (missing shape): {term}")
-
-        if isinstance(shape_raw, int):
-            shape = [int(shape_raw)]
-        else:
-            shape = [int(x) for x in list(shape_raw)]
-
-        dim = 1
-        for s in shape:
-            dim *= int(s)
-        total_dim += int(dim)
-
-        params: dict[str, Any] = {}
-        if isinstance(term.get("joint_names"), list):
-            params["joint_order"] = [str(x) for x in list(term.get("joint_names") or [])]
-        if isinstance(term.get("joint_pos_offsets"), list):
-            params["offsets"] = [float(x) for x in list(term.get("joint_pos_offsets") or [])]
-        if isinstance(term.get("joint_vel_offsets"), list):
-            params["offsets"] = [float(x) for x in list(term.get("joint_vel_offsets") or [])]
-        if params:
-            params.setdefault("relative", True)
-
-        out_terms.append(
-            {
-                "name": name,
-                "func": name,
-                "shape": shape,
-                "dim": int(dim),
-                "clip": None,
-                "params": params if params else None,
-            }
-        )
-
-    obs_cfg = {
-        "version": 1,
-        "group": "policy",
-        "total_dim": int(total_dim),
-        "terms": out_terms,
-        "source": {"type": "isaaclab", "file": "exported/IO_descriptors.yaml"},
-    }
-    _write_yaml(cfg.bundle_out / "observation_config.yaml", obs_cfg, force=cfg.force)
-
-    # ---- Actions: policy joint order only (NOT controller order)
-    actions = io.get("actions", None)
-    joint_names: Optional[list[str]] = None
-    a0: Optional[dict[str, Any]] = None
-    if isinstance(actions, list) and len(actions) > 0 and isinstance(actions[0], dict):
-        a0 = actions[0]
-        j = a0.get("joint_names", None)
-        if isinstance(j, list) and len(j) > 0:
-            joint_names = [str(x) for x in j]
-
-    if joint_names is None or a0 is None:
-        print("[WARN] Could not find actions[0].joint_names in IO_descriptors.yaml; skipping action_config.yaml generation.")
-        return
-
-    offsets = None
-    try:
-        if isinstance(a0.get("offset"), list):
-            offsets = [float(x) for x in (a0.get("offset") or [])]
-    except Exception:
-        offsets = None
-
-    action_cfg = {
-        "type": "joint_position",
-        # This is POLICY joint order (ABI). Runtime remaps to controller joints at runtime.
-        "joint_order": joint_names,
-        "scale": float(a0.get("scale")) if a0.get("scale") is not None else float(cfg.action_scale),
-        # Prefer explicit offsets from IO_descriptors.yaml in runtime. Keep default_pos fallback optional.
-        "use_default_offset": bool(cfg.action_use_default_offset),
-        "offset": offsets,
-        # Default: actions are relative to offsets (i.e., q = offset + scale * a).
-        "relative": True,
-        "clip": list(a0.get("clip")) if isinstance(a0.get("clip"), list) else [-1.0, 1.0],
-        "source": {"type": "isaaclab", "file": "exported/IO_descriptors.yaml"},
-    }
-    _write_yaml(cfg.bundle_out / "action_config.yaml", action_cfg, force=cfg.force)
+    We intentionally do not generate observation_config.yaml / action_config.yaml anymore.
+    The runtime derives the ABI from IO_descriptors.yaml on startup.
+    """
+    return
 
 
 def _load_observation_term_names_from_io(cfg: ExportConfig) -> list[str] | None:
@@ -501,15 +407,6 @@ def _write_placeholders_if_needed(cfg: ExportConfig) -> None:
     )
 
     _ensure_placeholder(
-        cfg.bundle_out / "action_config.yaml",
-        note="Replace or auto-generate from exported/IO_descriptors.yaml.",
-    )
-    _ensure_placeholder(
-        cfg.bundle_out / "observation_config.yaml",
-        note="Replace or auto-generate from exported/IO_descriptors.yaml.",
-    )
-
-    _ensure_placeholder(
         cfg.bundle_out / "obs_normalization.yaml",
         note="Optional. Replace with mean/std if you use observation normalization.",
     )
@@ -543,8 +440,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # 1) Copy Isaac Lab artifacts into bundle/exported/
     _copy_exported_artifacts(cfg)
 
-    # 2) Generate runtime ABI from bundle/exported/IO_descriptors.yaml
-    _generate_runtime_configs_from_io_descriptors(cfg)
+    # 2) Runtime derives ABI from IO_descriptors.yaml directly; do not generate duplicate ABI YAML files.
 
     # 3) Robot interface + metadata (term_inputs can be auto-filled if IO is present)
     obs_term_names = _load_observation_term_names_from_io(cfg)
