@@ -169,6 +169,16 @@ class {Robot}ObservationsBridge(Node):
 
         self.obs_slices = self._build_obs_slices(self.obs_terms)
         self.obs_size = sum(size for (_, size) in self.obs_slices.values())
+        scene = self.io.get('scene') or {}
+        if 'dt' in scene and scene['dt'] is not None:
+            self.publish_dt = float(scene['dt'])
+        else:
+            physics_dt = float(scene.get('physics_dt', 0.005))
+            decimation = int(scene.get('decimation', 1))
+            self.publish_dt = physics_dt * decimation
+        if self.publish_dt <= 0.0:
+            self.publish_dt = 0.02
+
 
         act0 = (self.io.get('actions') or [{}])[0]
         self.act_size = int(((act0.get('shape') or [0])[0]) or 0)
@@ -197,8 +207,16 @@ class {Robot}ObservationsBridge(Node):
         self.create_subscription(Twist, '/cmd_vel', self._cb_cmd_vel, 10)
         self.create_subscription(JointState, '/joint_states', self._cb_joint_states, 10)
         self.create_subscription(Float32MultiArray, '/policy/actions', self._cb_last_action, 10)
+        self.have_odom = False
+        self.have_imu = False
+        self.have_cmd_vel = False
+        self.have_joint_states = False
+        self.latest_joint_state = None
 
-        self.get_logger().info(f'Observation bridge ready: obs_size={self.obs_size}')
+        self.timer = self.create_timer(self.publish_dt, self._on_timer_publish)
+
+
+        self.get_logger().info(f'Observation bridge ready: obs_size={self.obs_size}, publish_hz={1.0/self.publish_dt:.2f}')
 
     def _build_obs_slices(self, terms):
         slices = {}
@@ -216,6 +234,7 @@ class {Robot}ObservationsBridge(Node):
     def _cb_odom(self, msg: Odometry) -> None:
         tw = msg.twist.twist
         self.base_lin_vel[:] = [tw.linear.x, tw.linear.y, tw.linear.z]
+        self.have_odom = True
 
     def _cb_imu(self, msg: Imu) -> None:
         av = msg.angular_velocity
@@ -228,9 +247,11 @@ class {Robot}ObservationsBridge(Node):
         # R is a rotation matrix, so R @ [0, 0, -1] is guaranteed to have norm 1.
         # Therefore, explicit normalization is unnecessary.
         self.projected_gravity[:] = (-R[:, 2]) * 9.8
+        self.have_imu = True
 
     def _cb_cmd_vel(self, msg: Twist) -> None:
         self.generated_commands[:] = [msg.linear.x, msg.linear.y, msg.angular.z]
+        self.have_cmd_vel = True
 
     def _cb_last_action(self, msg: Float32MultiArray) -> None:
         arr = np.asarray(msg.data, dtype=np.float32)
@@ -238,6 +259,15 @@ class {Robot}ObservationsBridge(Node):
             self.last_action[:] = arr
 
     def _cb_joint_states(self, msg: JointState) -> None:
+        self.latest_joint_state = msg
+        self.have_joint_states = True
+
+    def _on_timer_publish(self) -> None:
+        if not (self.have_odom and self.have_imu and self.have_cmd_vel and self.have_joint_states):
+            return
+        msg = self.latest_joint_state
+        if msg is None:
+            return
         name_to_idx = {n: i for i, n in enumerate(msg.name)}
 
         joint_pos_rel = np.zeros((len(self.policy_joint_names),), dtype=np.float32)
@@ -280,6 +310,7 @@ class {Robot}ObservationsBridge(Node):
         out = Float32MultiArray()
         out.data = obs.tolist()
         self.pub.publish(out)
+
 
 
 def main() -> None:
