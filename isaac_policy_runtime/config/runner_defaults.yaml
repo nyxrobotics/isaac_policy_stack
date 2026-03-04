@@ -1,5 +1,0 @@
-# Default runtime parameters (can be overridden via ROS params)
-bundle_path: ""
-use_tf: true
-strict: true
-log_io: true

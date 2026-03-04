@@ -11,8 +11,8 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <!-- Pull in the actual packages -->
-  <exec_depend>isaac_policy_runtime</exec_depend>
-  <exec_depend>isaac_policy_bringup</exec_depend>
+  <exec_depend>isaac_policy_runner</exec_depend>
+  <exec_depend>isaac_runner_generator</exec_depend>
 
   <!-- Optional: if you add a bundles package later -->
   <!-- <exec_depend>isaac_policy_bundles</exec_depend> -->

@@ -1,9 +1,6 @@
-isaac_policy_tools/isaac_policy_export/build/
-
-isaac_policy_tools/isaac_policy_runner_pkggen/build/
-
+__pycache__/
 *.pyc
-
-*.egg-info/
-
-*__pycache__/
+build/
+install/
+log/
+*.zip

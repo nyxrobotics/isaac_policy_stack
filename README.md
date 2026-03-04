@@ -1,64 +1,86 @@
-# isaac_policy_stack
+# isaac_policy_stack (ROS 2 Humble)
 
-ROS2 runtime for executing policies trained in Isaac Lab / Isaac Gym on robots.
+This repository provides:
 
-## Core Design
+- **isaac_policy_runner**: Generic ROS 2 node that runs an Isaac Lab exported policy (ONNX) by subscribing to observations and publishing actions.
+- **isaac_runner_generator**: ROS 2 CLI tool that generates a per-robot runner package (`<robot_name>_isaac_runner`) containing:
+  - `<robot_name>_observations_bridge_node`
+  - `<robot_name>_actions_bridge_node`
+  - a sample launch file that starts both bridge nodes and `isaac_policy_runner`
+  - a `model/` directory with placeholder model files:
+    - `IO_descriptors.yaml`
+    - `policy.onnx`
+    - `policy.pt`
 
-IO_descriptors.yaml is the single source of truth for the policy ABI.
+## Requirements
 
-Removed legacy files:
-- observation_config.yaml
-- action_config.yaml
-- obs_normalization.yaml
-- metadata.yaml
+- ROS 2 Humble
+- Python 3
+- `onnxruntime` (CPU), `numpy`, `pyyaml`
 
-Observation and action layouts are derived directly from IO_descriptors.yaml.
+Install python deps (example):
 
-## Policy Bundle Structure
-
-policy_bundle/
- ├── policy.pt
- ├── policy.onnx
- ├── IO_descriptors.yaml
- └── robot_interface.yaml
-
-Both policy.pt and policy.onnx exist in the bundle.
+```bash
+python3 -m pip install --user onnxruntime numpy pyyaml
+```
 
 ## Build
 
-mkdir -p ws/src
-cd ws/src
-git clone <repo>
+```bash
+cd <your_ws>/src
+# place this repo here (isaac_policy_stack/)
 cd ..
-colcon build
+colcon build --symlink-install
 source install/setup.bash
+```
 
-## Export Policy Bundle
+## Generate a robot runner package
 
-isaac-export-bundle \
-  --checkpoint policy.pt \
-  --io-descriptors IO_descriptors.yaml \
-  --bundle_out my_policy_bundle
+```bash
+ros2 run isaac_runner_generator create_robot_runner --robot <robot_name>
+```
 
-## Run Runtime
+This creates:
 
-ros2 launch isaac_policy_runtime policy_runner.launch.py \
-  bundle:=/path/to/policy_bundle
+```
+<robot_name>_isaac_runner/
+  launch/
+  model/
+  <robot_name>_isaac_runner/
+```
 
-## IO_descriptors.yaml
+Copy your trained model files into:
 
-Defines observation and action layout.
+```
+<robot_name>_isaac_runner/model/
+  IO_descriptors.yaml
+  policy.onnx
+  policy.pt
+```
 
-Example:
+## Run (sample launch)
 
-observations:
-  - name: base_ang_vel
-    dim: 3
+```bash
+ros2 launch <robot_name>_isaac_runner <robot_name>_isaac_runner.launch.py
+```
 
-actions:
-  - name: joint_position
-    joints: [hip_yaw, hip_roll, hip_pitch]
+### Topics
 
-## Runtime Pipeline
+- `/policy/observations` (`std_msgs/Float32MultiArray`) -> input to policy
+- `/policy/actions` (`std_msgs/Float32MultiArray`) -> output of policy
+- `/joint_group_position_controller/commands` (`std_msgs/Float64MultiArray`) -> joint targets
 
-ROS2 topics → observation terms → observation vector → policy → action vector → ROS2 commands
+### Controller
+
+This stack assumes the robot uses:
+
+```yaml
+joint_group_position_controller:
+  type: forward_command_controller/ForwardCommandController
+```
+
+## Notes
+
+- The policy runner is callback-driven (no internal control loop).
+- Parameter `use_internal_action_observation`:
+  - If `true`, the runner overwrites the `last_action` slice inside the incoming observation vector with the last action it published.
