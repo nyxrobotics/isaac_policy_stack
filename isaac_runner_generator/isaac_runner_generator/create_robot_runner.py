@@ -212,6 +212,8 @@ class {Robot}ObservationsBridge(Node):
         self.have_cmd_vel = False
         self.have_joint_states = False
         self.latest_joint_state = None
+        self._warned_missing_inputs = False
+        self._warned_missing_joints = False
 
         self.timer = self.create_timer(self.publish_dt, self._on_timer_publish)
 
@@ -263,12 +265,25 @@ class {Robot}ObservationsBridge(Node):
         self.have_joint_states = True
 
     def _on_timer_publish(self) -> None:
-        if not (self.have_odom and self.have_imu and self.have_cmd_vel and self.have_joint_states):
-            return
+        # Always publish on timer; use zeros/last values until inputs arrive.
+        if not self._warned_missing_inputs:
+            missing_inputs = []
+            if not self.have_odom:
+                missing_inputs.append('odom')
+            if not self.have_imu:
+                missing_inputs.append('imu')
+            if not self.have_cmd_vel:
+                missing_inputs.append('cmd_vel')
+            if not self.have_joint_states:
+                missing_inputs.append('joint_states')
+            if missing_inputs:
+                self.get_logger().warning(
+                    'Missing inputs: ' + ', '.join(missing_inputs) + ' (publishing zeros/last values)'
+                )
+            self._warned_missing_inputs = True
+
         msg = self.latest_joint_state
-        if msg is None:
-            return
-        name_to_idx = {n: i for i, n in enumerate(msg.name)}
+        name_to_idx = {n: i for i, n in enumerate(msg.name)} if msg is not None else {}
 
         joint_pos_rel = np.zeros((len(self.policy_joint_names),), dtype=np.float32)
         joint_vel_rel = np.zeros((len(self.policy_joint_names),), dtype=np.float32)
@@ -286,8 +301,9 @@ class {Robot}ObservationsBridge(Node):
             joint_pos_rel[k] = pos - pos0
             joint_vel_rel[k] = vel - vel0
 
-        if missing:
+        if missing and not self._warned_missing_joints:
             self.get_logger().warning('Missing joints in /joint_states: ' + ', '.join(missing))
+            self._warned_missing_joints = True
 
         obs = np.zeros((self.obs_size,), dtype=np.float32)
 
