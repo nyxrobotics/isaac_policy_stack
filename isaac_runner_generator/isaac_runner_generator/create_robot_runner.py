@@ -302,6 +302,7 @@ import yaml
 import rclpy
 from rclpy.node import Node
 from rcl_interfaces.srv import GetParameters
+from rcl_interfaces.msg import ParameterType
 
 from std_msgs.msg import Float32MultiArray, Float64MultiArray
 
@@ -378,8 +379,8 @@ class {Robot}ActionsBridge(Node):
                 self.get_logger().info('Controller parameters not ready yet...')
                 continue
             v = res.values[0]
-            if v.type != v.TYPE_STRING_ARRAY:
-                self.get_logger().warning('Controller joints param is not a string array; retrying...')
+            if v.type != ParameterType.PARAMETER_STRING_ARRAY:
+                self.get_logger().warning(f'Controller joints param has unexpected type: {v.type}; retrying...')
                 continue
             joints = list(v.string_array_value)
             if joints:
