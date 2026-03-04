@@ -52,9 +52,8 @@ class PolicyRunner(Node):
 
         self.bundle: PolicyBundle = load_bundle(bundle_path)
 
-        # Sanity-check: observation/action configs vs io_descriptors.yaml (if available).
-        # This is ABI-critical. If mismatch is detected and strict=True, we raise.
-        self._check_io_descriptor_consistency()
+        # IO_descriptors.yaml is the single source of truth for the policy ABI.
+        # The runtime ABI objects (observation_config/action_config) are derived from it.
 
         if ort is None:
             raise RuntimeError("onnxruntime is not installed. Install it with: pip install onnxruntime")
@@ -179,100 +178,6 @@ class PolicyRunner(Node):
                 )
         period = 1.0 / self.rate_hz
         self.timer = self.create_timer(period, self._step)
-
-    def _check_io_descriptor_consistency(self) -> None:
-        """Verify that the derived ABI is consistent with io_descriptors.yaml.
-
-        This check ensures the policy ABI (term order, per-term shapes, joint orders, and offsets)
-        matches what Isaac Lab exported.
-        """
-        io = self.bundle.io_descriptors
-        if not isinstance(io, dict):
-            return
-
-        errors: list[str] = []
-        warnings: list[str] = []
-
-        # ---- Observations
-        obs = io.get("observations")
-        policy = obs.get("policy") if isinstance(obs, dict) else None
-        if isinstance(policy, list):
-            io_names = [str(t.get("name")) for t in policy if isinstance(t, dict)]
-            cfg_names = [t.name for t in self.bundle.observation_config.terms]
-            if io_names != cfg_names:
-                errors.append(
-                    "observation term order mismatch: io_descriptors.yaml vs derived config\n"
-                    f"  io:  {io_names}\n  cfg: {cfg_names}"
-                )
-
-            # Per-term shape + joint details
-            by_name = {t.name: t for t in self.bundle.observation_config.terms}
-            for t in policy:
-                if not isinstance(t, dict):
-                    continue
-                name = str(t.get("name"))
-                cfg = by_name.get(name)
-                if cfg is None:
-                    continue
-                shape_raw = t.get("shape")
-                if shape_raw is not None:
-                    if isinstance(shape_raw, int):
-                        io_shape = [int(shape_raw)]
-                    else:
-                        io_shape = [int(x) for x in list(shape_raw)]
-                    cfg_shape = list(cfg.shape or [])
-                    if io_shape != cfg_shape:
-                        errors.append(f"observation shape mismatch for '{name}': io={io_shape} cfg={cfg_shape}")
-
-                # Joint order + offsets are meaning-bearing.
-                if isinstance(t.get("joint_names"), list):
-                    io_joints = [str(x) for x in list(t.get("joint_names") or [])]
-                    cfg_joints = list((cfg.params or {}).get("joint_order") or [])
-                    if io_joints != cfg_joints:
-                        errors.append(
-                            f"observation joint order mismatch for '{name}': io={io_joints} cfg={cfg_joints}"
-                        )
-
-                # Offsets keys differ by term type.
-                io_off = None
-                if isinstance(t.get("joint_pos_offsets"), list):
-                    io_off = [float(x) for x in list(t.get("joint_pos_offsets") or [])]
-                if isinstance(t.get("joint_vel_offsets"), list):
-                    io_off = [float(x) for x in list(t.get("joint_vel_offsets") or [])]
-                if io_off is not None:
-                    cfg_off = (cfg.params or {}).get("offsets")
-                    cfg_off = [float(x) for x in list(cfg_off or [])] if isinstance(cfg_off, list) else []
-                    if io_off != cfg_off:
-                        errors.append(
-                            f"observation offsets mismatch for '{name}': io={io_off} cfg={cfg_off}"
-                        )
-        else:
-            warnings.append("io_descriptors.yaml has no observations.policy; skipping observation consistency check")
-
-        # ---- Actions
-        actions = io.get("actions")
-        if isinstance(actions, list) and actions and isinstance(actions[0], dict):
-            a0 = actions[0]
-            io_joints = [str(x) for x in list(a0.get("joint_names") or [])]
-            cfg_joints = list(self.bundle.action_config.joint_order or [])
-            if io_joints and io_joints != cfg_joints:
-                errors.append(f"action joint order mismatch: io={io_joints} cfg={cfg_joints}")
-
-            if isinstance(a0.get("offset"), list) and self.bundle.action_config.offset is not None:
-                io_off = [float(x) for x in list(a0.get("offset") or [])]
-                cfg_off = [float(x) for x in list(self.bundle.action_config.offset or [])]
-                if io_off != cfg_off:
-                    errors.append(f"action offsets mismatch: io={io_off} cfg={cfg_off}")
-        else:
-            warnings.append("io_descriptors.yaml has no actions[0]; skipping action consistency check")
-
-        for w in warnings:
-            self.get_logger().warning(w)
-        if errors:
-            for e in errors:
-                self.get_logger().error(e)
-            if self.strict:
-                raise RuntimeError("IO descriptor consistency check failed (strict=True).")
 
     def _step(self):
         self._tick += 1
