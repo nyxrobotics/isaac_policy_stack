@@ -74,10 +74,22 @@ setup(
 """
 
 
-LAUNCH_TEMPLATE = """from launch import LaunchDescription
+LAUNCH_TEMPLATE = r"""from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.substitutions import PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
+
+
+# Remap table (edit the *right-hand side* as needed for your robot)
+REMAPS = [
+    ('/odom', '/odom'),
+    ('/imu', '/imu'),
+    ('/cmd_vel', '/cmd_vel'),
+    ('/joint_states', '/joint_states'),
+    ('/policy/observations', '/policy/observations'),
+    ('/policy/actions', '/policy/actions'),
+    ('/joint_group_position_controller/commands', '/joint_group_position_controller/commands'),
+]
 
 
 def generate_launch_description():
@@ -90,6 +102,7 @@ def generate_launch_description():
             name='{robot}_observations_bridge_node',
             output='screen',
             parameters=[{'model_dir': model_dir}],
+            remappings=REMAPS,
         ),
         Node(
             package='isaac_policy_runner',
@@ -97,6 +110,7 @@ def generate_launch_description():
             name='isaac_policy_runner',
             output='screen',
             parameters=[{'model_dir': model_dir, 'use_internal_action_observation': True}],
+            remappings=REMAPS,
         ),
         Node(
             package='{pkg}',
@@ -104,6 +118,7 @@ def generate_launch_description():
             name='{robot}_actions_bridge_node',
             output='screen',
             parameters=[{'model_dir': model_dir}],
+            remappings=REMAPS,
         ),
     ])
 """
