@@ -101,7 +101,11 @@ def generate_launch_description():
             executable='{robot}_observations_bridge_node',
             name='{robot}_observations_bridge_node',
             output='screen',
-            parameters=[{'model_dir': model_dir}],
+            parameters=[
+                {'model_dir': model_dir},
+                # Debug prints (similar to Isaac Lab)
+                {'debug_print': False, 'debug_every_n': 10},
+            ],
             remappings=REMAPS,
         ),
         Node(
@@ -117,7 +121,15 @@ def generate_launch_description():
             executable='{robot}_actions_bridge_node',
             name='{robot}_actions_bridge_node',
             output='screen',
-            parameters=[{'model_dir': model_dir}],
+            parameters=[
+                {'model_dir': model_dir},
+                # Stream /commands at physics_dt (recommended)
+                {'republish_from_timer': True},
+                # Hold default posture briefly at startup to match Isaac Lab reset
+                {'startup_hold_sec': 1.0},
+                # Debug prints (similar to Isaac Lab)
+                {'debug_print': False, 'debug_every_n': 10},
+            ],
             remappings=REMAPS,
         ),
     ])
@@ -364,6 +376,8 @@ class {Robot}ActionsBridge(Node):
         super().__init__('{robot}_actions_bridge_node')
 
         self.declare_parameter('model_dir', '')
+        self.declare_parameter('startup_hold_sec', 1.0)
+        self.declare_parameter('republish_from_timer', True)
         self.declare_parameter('debug_print', False)
         self.declare_parameter('debug_every_n', 1)
         self.debug_print = self.get_parameter('debug_print').get_parameter_value().bool_value
@@ -372,6 +386,9 @@ class {Robot}ActionsBridge(Node):
         model_dir = self.get_parameter('model_dir').get_parameter_value().string_value
         if not model_dir:
             raise RuntimeError("Parameter 'model_dir' is required")
+
+        self.startup_hold_sec = float(self.get_parameter('startup_hold_sec').get_parameter_value().double_value)
+        self.republish_from_timer = self.get_parameter('republish_from_timer').get_parameter_value().bool_value
 
         io_path = os.path.join(model_dir, 'IO_descriptors.yaml')
         with open(io_path, 'r', encoding='utf-8') as f:
@@ -383,6 +400,7 @@ class {Robot}ActionsBridge(Node):
         self.action_size = int(((act0.get('shape') or [len(self.action_joint_names)])[0]) or len(self.action_joint_names))
         self.action_offsets = list(act0.get('offset') or [0.0] * self.action_size)
         self.action_scale = float(act0.get('scale', 1.0))
+        self.action_clip = act0.get('clip', None)
 
         art = (self.io.get('articulations') or {}).get('robot') or {}
         self.articulation_joint_names = list(art.get('joint_names') or [])
@@ -394,6 +412,13 @@ class {Robot}ActionsBridge(Node):
             )
 
         self.default_pos_by_name = {n: float(p) for n, p in zip(self.articulation_joint_names, self.default_joint_pos)}
+
+        # Isaac Lab applies actions every physics step (physics_dt). We use this cadence to
+        # continuously stream /commands even if /policy/actions arrives slower.
+        scene = self.io.get('scene') or {}
+        self.physics_dt = float(scene.get('physics_dt', 0.005))
+        if self.physics_dt <= 0.0:
+            self.physics_dt = 0.005
 
         # Controller joint order is authoritative for /commands message layout.
         self.controller_joints = self._wait_for_controller_joints(
@@ -411,15 +436,22 @@ class {Robot}ActionsBridge(Node):
         self.ctrl_rule = []
         for j in self.controller_joints:
             if j in self.action_index_by_name:
-                self.ctrl_rule.append(('action', self.action_index_by_name[j]))
+                self.ctrl_rule.append(('action', int(self.action_index_by_name[j]), j))
             elif j in self.default_pos_by_name:
-                self.ctrl_rule.append(('default', j))
+                self.ctrl_rule.append(('default', None, j))
             else:
                 self.get_logger().warning(f"Controller joint '{j}' not found in IO_descriptors articulations; sending 0.0")
-                self.ctrl_rule.append(('zero', j))
+                self.ctrl_rule.append(('zero', None, j))
 
         self.pub = self.create_publisher(Float64MultiArray, '/joint_group_position_controller/commands', 10)
         self.sub = self.create_subscription(Float32MultiArray, '/policy/actions', self._cb_action, 10)
+
+        # Store last computed command and (optionally) republish it on a timer.
+        self._last_targets = self._default_targets()
+        self._have_action = False
+        self._t0 = self.get_clock().now()
+        if self.republish_from_timer:
+            self.timer = self.create_timer(self.physics_dt, self._on_timer)
 
     def _wait_for_controller_joints(self, node_name: str, param_name: str):
         client = self.create_client(GetParameters, f'{node_name}/get_parameters')
@@ -447,13 +479,60 @@ class {Robot}ActionsBridge(Node):
     def _action_to_target(self, act: np.ndarray, act_i: int) -> float:
         # Isaac Lab's JointPositionAction typically does: target = offset + scale * action
         off = float(self.action_offsets[act_i]) if act_i < len(self.action_offsets) else 0.0
-        return off + self.action_scale * float(act[act_i])
+        a = float(act[act_i])
+
+        # Respect exported clip (can be scalar or per-joint list)
+        if self.action_clip is not None:
+            if isinstance(self.action_clip, (int, float)):
+                c = float(self.action_clip)
+                if c > 0.0:
+                    a = max(-c, min(c, a))
+            elif isinstance(self.action_clip, (list, tuple)) and act_i < len(self.action_clip):
+                c = float(self.action_clip[act_i])
+                if c > 0.0:
+                    a = max(-c, min(c, a))
+
+        return off + self.action_scale * a
+
+    def _default_targets(self) -> list[float]:
+        # Default command for ALL controller joints.
+        out: list[float] = []
+        for _kind, _idx, j in self.ctrl_rule:
+            out.append(float(self.default_pos_by_name.get(str(j), 0.0)))
+        return out
+
+    def _compute_targets_from_action(self, act: np.ndarray) -> list[float]:
+        targets: list[float] = []
+        for kind, idx, j in self.ctrl_rule:
+            if kind == 'action':
+                targets.append(self._action_to_target(act, int(idx)))
+            elif kind == 'default':
+                targets.append(float(self.default_pos_by_name.get(str(j), 0.0)))
+            else:
+                targets.append(0.0)
+        return targets
+
+    def _publish_targets(self, targets: list[float]) -> None:
+        out = Float64MultiArray()
+        out.data = [float(x) for x in targets]
+        self.pub.publish(out)
+
+    def _on_timer(self) -> None:
+        # Keep streaming commands even if actions arrive slower than physics_dt.
+        # Also, hold default posture for a short period after startup.
+        now = self.get_clock().now()
+        t = (now - self._t0).nanoseconds * 1e-9
+        if (not self._have_action) or (t < self.startup_hold_sec):
+            self._publish_targets(self._default_targets())
+        else:
+            self._publish_targets(self._last_targets)
 
     def _cb_action(self, msg: Float32MultiArray) -> None:
         act = np.asarray(msg.data, dtype=np.float32)
         if act.size != self.action_size:
             self.get_logger().warning(f'Action size mismatch: got {act.size}, expected {self.action_size}')
             return
+
 
         if self.debug_print:
             self._debug_count += 1
@@ -462,18 +541,17 @@ class {Robot}ActionsBridge(Node):
                 applied = np.array([self._action_to_target(act, i) for i in range(self.action_size)], dtype=np.float32)
                 self.get_logger().info(f"APPLIED ACTION: {applied}")
 
-        targets = []
-        for kind, val in self.ctrl_rule:
-            if kind == 'action':
-                targets.append(self._action_to_target(act, int(val)))
-            elif kind == 'default':
-                targets.append(float(self.default_pos_by_name[str(val)]))
-            else:
-                targets.append(0.0)
+        self._last_targets = self._compute_targets_from_action(act)
+        self._have_action = True
 
-        out = Float64MultiArray()
-        out.data = [float(x) for x in targets]
-        self.pub.publish(out)
+        # If timer republish is disabled, publish directly from callback.
+        if not self.republish_from_timer:
+            now = self.get_clock().now()
+            t = (now - self._t0).nanoseconds * 1e-9
+            if t < self.startup_hold_sec:
+                self._publish_targets(self._default_targets())
+            else:
+                self._publish_targets(self._last_targets)
 
 
 def main() -> None:
