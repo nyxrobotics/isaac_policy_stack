@@ -16,8 +16,8 @@ class IsaacPolicyRunner(Node):
         super().__init__("isaac_policy_runner")
 
         self.declare_parameter("model_dir", "")
-        self.declare_parameter("use_internal_action_observation", True)
-        self.declare_parameter("debug_print", True)
+        self.declare_parameter("use_internal_action_observation", False)
+        self.declare_parameter("debug_print", False)
         self.declare_parameter("debug_every_n", 1)
         self.debug_print = self.get_parameter("debug_print").get_parameter_value().bool_value
         self.debug_every_n = int(self.get_parameter("debug_every_n").get_parameter_value().integer_value) or 1

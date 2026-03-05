@@ -399,7 +399,13 @@ class {Robot}ActionsBridge(Node):
         self.action_joint_names = list(act0.get('joint_names') or [])
         self.action_size = int(((act0.get('shape') or [len(self.action_joint_names)])[0]) or len(self.action_joint_names))
         self.action_offsets = list(act0.get('offset') or [0.0] * self.action_size)
-        self.action_scale = float(act0.get('scale', 1.0))
+        scale_cfg = act0.get('scale', 1.0)
+        if isinstance(scale_cfg, (int, float)):
+            self.action_scale = float(scale_cfg)
+        elif isinstance(scale_cfg, (list, tuple)):
+            self.action_scale = [float(x) for x in scale_cfg]
+        else:
+            self.action_scale = 1.0
         self.action_clip = act0.get('clip', None)
 
         art = (self.io.get('articulations') or {}).get('robot') or {}
@@ -477,22 +483,38 @@ class {Robot}ActionsBridge(Node):
             self.get_logger().info('Controller joints list empty; retrying...')
 
     def _action_to_target(self, act: np.ndarray, act_i: int) -> float:
-        # Isaac Lab's JointPositionAction typically does: target = offset + scale * action
+        # Isaac Lab JointAction:
+        #   processed = raw * scale + offset
+        #   if clip is provided: clamp(processed, min=clip[...,0], max=clip[...,1])
+        a_raw = float(act[act_i])
+        scale = float(self.action_scale[act_i]) if isinstance(self.action_scale, (list, tuple)) and act_i < len(self.action_scale) else float(self.action_scale)
         off = float(self.action_offsets[act_i]) if act_i < len(self.action_offsets) else 0.0
-        a = float(act[act_i])
 
-        # Respect exported clip (can be scalar or per-joint list)
+        processed = a_raw * scale + off
+
+        # Respect exported clip (Isaac Lab exports per-joint [min,max] pairs).
         if self.action_clip is not None:
-            if isinstance(self.action_clip, (int, float)):
-                c = float(self.action_clip)
-                if c > 0.0:
-                    a = max(-c, min(c, a))
-            elif isinstance(self.action_clip, (list, tuple)) and act_i < len(self.action_clip):
-                c = float(self.action_clip[act_i])
-                if c > 0.0:
-                    a = max(-c, min(c, a))
+            c = self.action_clip
+            try:
+                if isinstance(c, (list, tuple)) and act_i < len(c) and isinstance(c[act_i], (list, tuple)) and len(c[act_i]) >= 2:
+                    cmin = float(c[act_i][0])
+                    cmax = float(c[act_i][1])
+                    if processed < cmin:
+                        processed = cmin
+                    elif processed > cmax:
+                        processed = cmax
+                elif isinstance(c, (list, tuple)) and len(c) >= 2 and not isinstance(c[0], (list, tuple)):
+                    # Fallback: global [min, max]
+                    cmin = float(c[0]); cmax = float(c[1])
+                    if processed < cmin:
+                        processed = cmin
+                    elif processed > cmax:
+                        processed = cmax
+            except Exception:
+                # If clip format is unexpected, ignore.
+                pass
 
-        return off + self.action_scale * a
+        return processed
 
     def _default_targets(self) -> list[float]:
         # Default command for ALL controller joints.
