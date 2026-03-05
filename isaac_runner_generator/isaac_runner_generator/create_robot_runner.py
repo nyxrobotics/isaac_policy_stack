@@ -155,6 +155,11 @@ class {Robot}ObservationsBridge(Node):
         super().__init__('{robot}_observations_bridge_node')
 
         self.declare_parameter('model_dir', '')
+        self.declare_parameter('debug_print', False)
+        self.declare_parameter('debug_every_n', 1)
+        self.debug_print = self.get_parameter('debug_print').get_parameter_value().bool_value
+        self.debug_every_n = int(self.get_parameter('debug_every_n').get_parameter_value().integer_value) or 1
+        self._debug_count = 0
         model_dir = self.get_parameter('model_dir').get_parameter_value().string_value
         if not model_dir:
             raise RuntimeError("Parameter 'model_dir' is required")
@@ -186,7 +191,7 @@ class {Robot}ObservationsBridge(Node):
         # caches
         self.base_lin_vel = np.zeros((3,), dtype=np.float32)
         self.base_ang_vel = np.zeros((3,), dtype=np.float32)
-        self.projected_gravity = np.array([0.0, 0.0, -9.8], dtype=np.float32)
+        self.projected_gravity = np.array([0.0, 0.0, -1.0], dtype=np.float32)
         self.generated_commands = np.zeros((3,), dtype=np.float32)
         self.last_action = np.zeros((self.act_size,), dtype=np.float32)
 
@@ -248,7 +253,7 @@ class {Robot}ObservationsBridge(Node):
         # NOTE: adjust if your IMU frame differs
         # R is a rotation matrix, so R @ [0, 0, -1] is guaranteed to have norm 1.
         # Therefore, explicit normalization is unnecessary.
-        self.projected_gravity[:] = (-R[:, 2]) * 9.8
+        self.projected_gravity[:] = (-R[:, 2])
         self.have_imu = True
 
     def _cb_cmd_vel(self, msg: Twist) -> None:
@@ -359,6 +364,11 @@ class {Robot}ActionsBridge(Node):
         super().__init__('{robot}_actions_bridge_node')
 
         self.declare_parameter('model_dir', '')
+        self.declare_parameter('debug_print', False)
+        self.declare_parameter('debug_every_n', 1)
+        self.debug_print = self.get_parameter('debug_print').get_parameter_value().bool_value
+        self.debug_every_n = int(self.get_parameter('debug_every_n').get_parameter_value().integer_value) or 1
+        self._debug_count = 0
         model_dir = self.get_parameter('model_dir').get_parameter_value().string_value
         if not model_dir:
             raise RuntimeError("Parameter 'model_dir' is required")
@@ -444,6 +454,13 @@ class {Robot}ActionsBridge(Node):
         if act.size != self.action_size:
             self.get_logger().warning(f'Action size mismatch: got {act.size}, expected {self.action_size}')
             return
+
+        if self.debug_print:
+            self._debug_count += 1
+            if (self._debug_count % self.debug_every_n) == 0:
+                self.get_logger().info(f"[policy] actions: {act}")
+                applied = np.array([self._action_to_target(act, i) for i in range(self.action_size)], dtype=np.float32)
+                self.get_logger().info(f"APPLIED ACTION: {applied}")
 
         targets = []
         for kind, val in self.ctrl_rule:

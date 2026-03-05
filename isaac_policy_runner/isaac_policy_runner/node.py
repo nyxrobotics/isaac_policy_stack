@@ -16,7 +16,12 @@ class IsaacPolicyRunner(Node):
         super().__init__("isaac_policy_runner")
 
         self.declare_parameter("model_dir", "")
-        self.declare_parameter("use_internal_action_observation", False)
+        self.declare_parameter("use_internal_action_observation", True)
+        self.declare_parameter("debug_print", True)
+        self.declare_parameter("debug_every_n", 1)
+        self.debug_print = self.get_parameter("debug_print").get_parameter_value().bool_value
+        self.debug_every_n = int(self.get_parameter("debug_every_n").get_parameter_value().integer_value) or 1
+        self._debug_count = 0
 
         model_dir = self.get_parameter("model_dir").get_parameter_value().string_value
         self.use_internal_action_observation = (
@@ -30,6 +35,7 @@ class IsaacPolicyRunner(Node):
         onnx_path = os.path.join(model_dir, "policy.onnx")
 
         self.io = load_io_descriptors(io_path)
+        self.obs_slices = self.io.observation.slices
         self.obs_size = int(self.io.observation.total_size)
         self.act_size = int(self.io.action_size)
 
@@ -63,6 +69,27 @@ class IsaacPolicyRunner(Node):
             else:
                 self.get_logger().warning("last_action slice mismatch; cannot override")
 
+        if self.debug_print:
+            self._debug_count += 1
+            if (self._debug_count % self.debug_every_n) == 0:
+                def _sl(name: str):
+                    if name not in self.obs_slices:
+                        return None
+                    s, n = self.obs_slices[name]
+                    return obs[s:s+n]
+                base_lin_vel = _sl('base_lin_vel')
+                base_ang_vel = _sl('base_ang_vel')
+                projected_gravity = _sl('projected_gravity')
+                vel_cmd = _sl('generated_commands')
+                joint_pos = _sl('joint_pos_rel')
+                joint_vel = _sl('joint_vel_rel')
+                if base_lin_vel is not None: self.get_logger().info(f"[policy] base_lin_vel: {base_lin_vel}")
+                if base_ang_vel is not None: self.get_logger().info(f"[policy] base_ang_vel: {base_ang_vel}")
+                if projected_gravity is not None: self.get_logger().info(f"[policy] projected_gravity: {projected_gravity}")
+                if vel_cmd is not None: self.get_logger().info(f"[policy] velocity_commands: {vel_cmd}")
+                if joint_pos is not None: self.get_logger().info(f"[policy] joint_pos: {joint_pos}")
+                if joint_vel is not None: self.get_logger().info(f"[policy] joint_vel: {joint_vel}")
+
         inp = obs.reshape(1, -1)
         out = self.session.run([self.output_name], {self.input_name: inp})[0]
         act = np.asarray(out, dtype=np.float32).reshape(-1)
@@ -71,6 +98,8 @@ class IsaacPolicyRunner(Node):
             self.get_logger().warning(f"Action size mismatch: got {act.size}, expected {self.act_size}")
             return
 
+        if self.debug_print and (self._debug_count % self.debug_every_n) == 0:
+            self.get_logger().info(f"[policy] actions: {act}")
         self.last_action = act
 
         out_msg = Float32MultiArray()
