@@ -39,6 +39,13 @@ class IsaacPolicyRunner(Node):
         self.obs_size = int(self.io.observation.total_size)
         self.act_size = int(self.io.action_size)
 
+        # Debug: show joint order from IO_descriptors.yaml
+        try:
+            self.get_logger().info('IO action joint order: ' + ', '.join(self.io.joint.action_joint_names))
+            self.get_logger().info('IO observation joint_pos_rel order: ' + ', '.join(self.io.joint.joint_names))
+        except Exception as e:
+            self.get_logger().warning(f'Failed to print IO joint orders: {e}')
+
         # Isaac Lab uses observation term name: 'last_action'
         self.last_action_slice = self.io.observation.slices.get("last_action", None)
         self.last_action = np.zeros((self.act_size,), dtype=np.float32)

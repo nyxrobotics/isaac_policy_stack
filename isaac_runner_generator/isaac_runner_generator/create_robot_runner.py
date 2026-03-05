@@ -180,6 +180,13 @@ class {Robot}ObservationsBridge(Node):
         with open(io_path, 'r', encoding='utf-8') as f:
             self.io = yaml.safe_load(f) or {}
 
+        # Debug: show observation joint order from IO_descriptors.yaml
+        obs_terms = (self.io.get('observations') or {}).get('policy') or []
+        pos_term = next((t for t in obs_terms if t.get('name') == 'joint_pos_rel'), None)
+        self.policy_joint_names = list((pos_term or {}).get('joint_names') or [])
+        if self.policy_joint_names:
+            self.get_logger().info('IO observation joint_pos_rel order: ' + ', '.join(self.policy_joint_names))
+
         self.obs_terms = (self.io.get('observations') or {}).get('policy') or []
         if not self.obs_terms:
             raise RuntimeError('IO_descriptors.yaml: observations.policy is empty')
@@ -199,6 +206,11 @@ class {Robot}ObservationsBridge(Node):
 
         act0 = (self.io.get('actions') or [{}])[0]
         self.act_size = int(((act0.get('shape') or [0])[0]) or 0)
+        self.action_joint_names = list(act0.get('joint_names') or [])
+        if self.action_joint_names:
+            self.get_logger().info('IO action joint order: ' + ', '.join(self.action_joint_names))
+        if self.action_joint_names:
+            self.get_logger().info('IO action joint order: ' + ', '.join(self.action_joint_names))
 
         # caches
         self.base_lin_vel = np.zeros((3,), dtype=np.float32)
@@ -214,6 +226,8 @@ class {Robot}ObservationsBridge(Node):
             raise RuntimeError("IO_descriptors.yaml must contain joint_pos_rel and joint_vel_rel")
 
         self.policy_joint_names = list(self.joint_pos_term.get('joint_names') or [])
+        if self.policy_joint_names:
+            self.get_logger().info('IO observation joint_pos_rel order: ' + ', '.join(self.policy_joint_names))
         self.policy_joint_pos_offsets = list(self.joint_pos_term.get('joint_pos_offsets') or [])
         self.policy_joint_vel_offsets = list(self.joint_vel_term.get('joint_vel_offsets') or [0.0]*len(self.policy_joint_names))
 
@@ -394,9 +408,18 @@ class {Robot}ActionsBridge(Node):
         with open(io_path, 'r', encoding='utf-8') as f:
             self.io = yaml.safe_load(f) or {}
 
+        # Debug: show observation joint order from IO_descriptors.yaml
+        obs_terms = (self.io.get('observations') or {}).get('policy') or []
+        pos_term = next((t for t in obs_terms if t.get('name') == 'joint_pos_rel'), None)
+        self.policy_joint_names = list((pos_term or {}).get('joint_names') or [])
+        if self.policy_joint_names:
+            self.get_logger().info('IO observation joint_pos_rel order: ' + ', '.join(self.policy_joint_names))
+
         # ----- Isaac Lab IO parsing (matches exported IO_descriptors.yaml) -----
         act0 = (self.io.get('actions') or [{}])[0]
         self.action_joint_names = list(act0.get('joint_names') or [])
+        if self.action_joint_names:
+            self.get_logger().info('IO action joint order: ' + ', '.join(self.action_joint_names))
         self.action_size = int(((act0.get('shape') or [len(self.action_joint_names)])[0]) or len(self.action_joint_names))
         self.action_offsets = list(act0.get('offset') or [0.0] * self.action_size)
         scale_cfg = act0.get('scale', 1.0)
@@ -407,6 +430,13 @@ class {Robot}ActionsBridge(Node):
         else:
             self.action_scale = 1.0
         self.action_clip = act0.get('clip', None)
+
+        # Note: We treat IO_descriptors.yaml 'offset' as part of the absolute joint target.
+        # Isaac Lab JointPositionAction semantics:
+        #   processed = raw * scale + offset
+        #   if clip is provided: clamp(processed)
+        # and the articulation receives this processed value as the position target (no extra default added).
+        self.get_logger().info('Action target formula: target = raw * scale + offset (no extra default_joint_pos added)')
 
         art = (self.io.get('articulations') or {}).get('robot') or {}
         self.articulation_joint_names = list(art.get('joint_names') or [])

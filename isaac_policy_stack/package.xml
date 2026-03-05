@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>isaac_policy_stack</name>
-  <version>0.1.0</version>
+  <version>0.1.5</version>
   <description>Meta-package that groups Isaac policy runtime, bringup, and tools in a single repository.</description>
 
   <maintainer email="you@example.com">Your Name</maintainer>

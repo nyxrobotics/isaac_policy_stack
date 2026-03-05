@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>isaac_runner_generator</name>
-  <version>0.1.0</version>
+  <version>0.1.5</version>
   <description>Generator that creates per-robot Isaac policy runner packages for ROS 2 Humble.</description>
   <maintainer email="user@example.com">user</maintainer>
   <license>Apache-2.0</license>

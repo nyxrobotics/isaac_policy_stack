@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>isaac_policy_runner</name>
-  <version>0.1.0</version>
+  <version>0.1.5</version>
   <description>Generic Isaac Lab policy runner node (ONNX) for ROS 2 Humble.</description>
   <maintainer email="user@example.com">user</maintainer>
   <license>Apache-2.0</license>
