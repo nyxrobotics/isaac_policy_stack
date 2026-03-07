@@ -82,9 +82,7 @@ from launch_ros.substitutions import FindPackageShare
 
 # Remap table (edit the *right-hand side* as needed for your robot)
 REMAPS = [
-    # Canele odom publishes twist in base_link on /body_odom and /body_odom_filtered.
-    # For Isaac Lab base_lin_vel, prefer a body-frame odom topic here.
-    ('/odom', '/body_odom'),
+    ('/odom', '/odom'),
     ('/imu', '/imu'),
     ('/cmd_vel', '/cmd_vel'),
     ('/joint_states', '/joint_states'),
@@ -106,7 +104,7 @@ def generate_launch_description():
             parameters=[
                 {'model_dir': model_dir},
                 # Debug prints (similar to Isaac Lab)
-                {'debug_print': False, 'debug_every_n': 10},
+                {'debug_print': True, 'debug_every_n': 1},
             ],
             remappings=REMAPS,
         ),
@@ -128,7 +126,7 @@ def generate_launch_description():
                 # Hold default posture briefly at startup to match Isaac Lab reset
                 {'startup_hold_sec': 1.0},
                 # Debug prints (similar to Isaac Lab)
-                {'debug_print': False, 'debug_every_n': 10},
+                {'debug_print': True, 'debug_every_n': 1},
             ],
             remappings=REMAPS,
         ),
@@ -169,8 +167,10 @@ class {Robot}ObservationsBridge(Node):
         self.declare_parameter('model_dir', '')
         self.declare_parameter('debug_print', False)
         self.declare_parameter('debug_every_n', 1)
+        self.declare_parameter('odom_twist_in_world_frame', False)
         self.debug_print = self.get_parameter('debug_print').get_parameter_value().bool_value
         self.debug_every_n = int(self.get_parameter('debug_every_n').get_parameter_value().integer_value) or 1
+        self.odom_twist_in_world_frame = self.get_parameter('odom_twist_in_world_frame').get_parameter_value().bool_value
         self._debug_count = 0
         model_dir = self.get_parameter('model_dir').get_parameter_value().string_value
         if not model_dir:
@@ -217,8 +217,10 @@ class {Robot}ObservationsBridge(Node):
 
         # caches
         self.base_lin_vel = np.zeros((3,), dtype=np.float32)
+        self.odom_linear = np.zeros((3,), dtype=np.float32)
         self.base_ang_vel = np.zeros((3,), dtype=np.float32)
         self.projected_gravity = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        self.rotation_body_to_world = np.eye(3, dtype=np.float32)
         self.generated_commands = np.zeros((3,), dtype=np.float32)
         self.last_action = np.zeros((self.act_size,), dtype=np.float32)
 
@@ -252,7 +254,10 @@ class {Robot}ObservationsBridge(Node):
         self.timer = self.create_timer(self.publish_dt, self._on_timer_publish)
 
 
-        self.get_logger().info(f'Observation bridge ready: obs_size={self.obs_size}, publish_hz={1.0/self.publish_dt:.2f}')
+        self.get_logger().info(
+            f'Observation bridge ready: obs_size={self.obs_size}, publish_hz={1.0/self.publish_dt:.2f}, ' 
+            f'odom_twist_in_world_frame={self.odom_twist_in_world_frame}'
+        )
 
     def _build_obs_slices(self, terms):
         slices = {}
@@ -319,12 +324,12 @@ class {Robot}ObservationsBridge(Node):
         self.base_ang_vel[:] = [av.x, av.y, av.z]
 
         q = msg.orientation
-        R_body_to_world = quat_to_rotmat(q.x, q.y, q.z, q.w)
+        R = quat_to_rotmat(q.x, q.y, q.z, q.w)
 
-        # Isaac Lab projected_gravity is the world gravity vector expressed in the base frame.
-        # For a body->world rotation matrix R, that is: g_body = R^T * [0, 0, -1].
-        # This equals the negative third ROW of R, not the third COLUMN.
-        self.projected_gravity[:] = (-R_body_to_world[2, :]).astype(np.float32)
+        # NOTE: adjust if your IMU frame differs
+        # R is a rotation matrix, so R @ [0, 0, -1] is guaranteed to have norm 1.
+        # Therefore, explicit normalization is unnecessary.
+        self.projected_gravity[:] = (-R[:, 2])
         self.have_imu = True
 
     def _cb_cmd_vel(self, msg: Twist) -> None:
@@ -698,4 +703,3 @@ def main() -> None:
     out_dir = Path(args.out).resolve()
     pkg_dir = create_robot_pkg(robot, out_dir)
     print(f'Created: {pkg_dir}')
-
