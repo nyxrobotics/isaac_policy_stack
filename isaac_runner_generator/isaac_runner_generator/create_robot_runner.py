@@ -82,7 +82,9 @@ from launch_ros.substitutions import FindPackageShare
 
 # Remap table (edit the *right-hand side* as needed for your robot)
 REMAPS = [
-    ('/odom', '/odom'),
+    # Canele odom publishes twist in base_link on /body_odom and /body_odom_filtered.
+    # For Isaac Lab base_lin_vel, prefer a body-frame odom topic here.
+    ('/odom', '/body_odom'),
     ('/imu', '/imu'),
     ('/cmd_vel', '/cmd_vel'),
     ('/joint_states', '/joint_states'),
@@ -123,8 +125,6 @@ def generate_launch_description():
             output='screen',
             parameters=[
                 {'model_dir': model_dir},
-                # Stream /commands at physics_dt (recommended)
-                {'republish_from_timer': True},
                 # Hold default posture briefly at startup to match Isaac Lab reset
                 {'startup_hold_sec': 1.0},
                 # Debug prints (similar to Isaac Lab)
@@ -136,7 +136,7 @@ def generate_launch_description():
 """
 
 
-OBS_BRIDGE_TEMPLATE = r"""from __future__ import annotations
+OBS_BRIDGE_TEMPLATE = r'''from __future__ import annotations
 
 import os
 import numpy as np
@@ -190,6 +190,9 @@ class {Robot}ObservationsBridge(Node):
         self.obs_terms = (self.io.get('observations') or {}).get('policy') or []
         if not self.obs_terms:
             raise RuntimeError('IO_descriptors.yaml: observations.policy is empty')
+
+        # term lookup for overloads
+        self.obs_term_by_name = {t.get('name'): t for t in self.obs_terms if t.get('name')}
 
         self.obs_slices = self._build_obs_slices(self.obs_terms)
         self.obs_size = sum(size for (_, size) in self.obs_slices.values())
@@ -264,6 +267,48 @@ class {Robot}ObservationsBridge(Node):
             cursor += size
         return slices
 
+    def _apply_overloads(self, term: str, vec: np.ndarray) -> np.ndarray:
+        """Apply IO_descriptors.yaml observation overloads (scale/clip).
+
+        Isaac Lab applies these overloads after term computation. We mirror that here.
+        Supported forms:
+          - scale: None | float | list[float]
+          - clip: None | float (symmetric) | [min, max] | list[[min,max], ...]
+        """
+        t = self.obs_term_by_name.get(term)
+        if not t:
+            return vec
+        ov = t.get('overloads') or {}
+
+        out = vec.astype(np.float32, copy=True)
+
+        scale = ov.get('scale', None)
+        if scale is not None:
+            if isinstance(scale, (int, float)):
+                out *= float(scale)
+            elif isinstance(scale, (list, tuple)):
+                s = np.asarray(scale, dtype=np.float32)
+                if s.size == out.size:
+                    out *= s.reshape(out.shape)
+
+        clip = ov.get('clip', None)
+        if clip is not None:
+            if isinstance(clip, (int, float)):
+                c = float(clip)
+                out = np.clip(out, -c, c)
+            elif isinstance(clip, (list, tuple)):
+                # [min, max]
+                if len(clip) == 2 and all(isinstance(x, (int, float)) for x in clip):
+                    out = np.clip(out, float(clip[0]), float(clip[1]))
+                else:
+                    # per-element [[min,max], ...]
+                    c = np.asarray(clip, dtype=np.float32)
+                    if c.shape == (out.size, 2):
+                        lo = c[:, 0].reshape(out.shape)
+                        hi = c[:, 1].reshape(out.shape)
+                        out = np.minimum(np.maximum(out, lo), hi)
+        return out
+
     def _cb_odom(self, msg: Odometry) -> None:
         tw = msg.twist.twist
         self.base_lin_vel[:] = [tw.linear.x, tw.linear.y, tw.linear.z]
@@ -274,12 +319,12 @@ class {Robot}ObservationsBridge(Node):
         self.base_ang_vel[:] = [av.x, av.y, av.z]
 
         q = msg.orientation
-        R = quat_to_rotmat(q.x, q.y, q.z, q.w)
+        R_body_to_world = quat_to_rotmat(q.x, q.y, q.z, q.w)
 
-        # NOTE: adjust if your IMU frame differs
-        # R is a rotation matrix, so R @ [0, 0, -1] is guaranteed to have norm 1.
-        # Therefore, explicit normalization is unnecessary.
-        self.projected_gravity[:] = (-R[:, 2])
+        # Isaac Lab projected_gravity is the world gravity vector expressed in the base frame.
+        # For a body->world rotation matrix R, that is: g_body = R^T * [0, 0, -1].
+        # This equals the negative third ROW of R, not the third COLUMN.
+        self.projected_gravity[:] = (-R_body_to_world[2, :]).astype(np.float32)
         self.have_imu = True
 
     def _cb_cmd_vel(self, msg: Twist) -> None:
@@ -344,7 +389,7 @@ class {Robot}ObservationsBridge(Node):
             start, size = self.obs_slices[term]
             if vec.size != size:
                 raise RuntimeError(f'Term size mismatch for {term}: {vec.size} != {size}')
-            obs[start:start+size] = vec
+            obs[start:start+size] = self._apply_overloads(term, vec)
 
         put('base_lin_vel', self.base_lin_vel)
         put('base_ang_vel', self.base_ang_vel)
@@ -368,7 +413,7 @@ def main() -> None:
     finally:
         node.destroy_node()
         rclpy.shutdown()
-"""
+'''
 
 
 ACT_BRIDGE_TEMPLATE = r"""from __future__ import annotations
@@ -391,7 +436,6 @@ class {Robot}ActionsBridge(Node):
 
         self.declare_parameter('model_dir', '')
         self.declare_parameter('startup_hold_sec', 1.0)
-        self.declare_parameter('republish_from_timer', True)
         self.declare_parameter('debug_print', False)
         self.declare_parameter('debug_every_n', 1)
         self.debug_print = self.get_parameter('debug_print').get_parameter_value().bool_value
@@ -402,7 +446,6 @@ class {Robot}ActionsBridge(Node):
             raise RuntimeError("Parameter 'model_dir' is required")
 
         self.startup_hold_sec = float(self.get_parameter('startup_hold_sec').get_parameter_value().double_value)
-        self.republish_from_timer = self.get_parameter('republish_from_timer').get_parameter_value().bool_value
 
         io_path = os.path.join(model_dir, 'IO_descriptors.yaml')
         with open(io_path, 'r', encoding='utf-8') as f:
@@ -449,13 +492,6 @@ class {Robot}ActionsBridge(Node):
 
         self.default_pos_by_name = {n: float(p) for n, p in zip(self.articulation_joint_names, self.default_joint_pos)}
 
-        # Isaac Lab applies actions every physics step (physics_dt). We use this cadence to
-        # continuously stream /commands even if /policy/actions arrives slower.
-        scene = self.io.get('scene') or {}
-        self.physics_dt = float(scene.get('physics_dt', 0.005))
-        if self.physics_dt <= 0.0:
-            self.physics_dt = 0.005
-
         # Controller joint order is authoritative for /commands message layout.
         self.controller_joints = self._wait_for_controller_joints(
             node_name='/joint_group_position_controller',
@@ -482,12 +518,7 @@ class {Robot}ActionsBridge(Node):
         self.pub = self.create_publisher(Float64MultiArray, '/joint_group_position_controller/commands', 10)
         self.sub = self.create_subscription(Float32MultiArray, '/policy/actions', self._cb_action, 10)
 
-        # Store last computed command and (optionally) republish it on a timer.
-        self._last_targets = self._default_targets()
-        self._have_action = False
         self._t0 = self.get_clock().now()
-        if self.republish_from_timer:
-            self.timer = self.create_timer(self.physics_dt, self._on_timer)
 
     def _wait_for_controller_joints(self, node_name: str, param_name: str):
         client = self.create_client(GetParameters, f'{node_name}/get_parameters')
@@ -569,15 +600,6 @@ class {Robot}ActionsBridge(Node):
         out.data = [float(x) for x in targets]
         self.pub.publish(out)
 
-    def _on_timer(self) -> None:
-        # Keep streaming commands even if actions arrive slower than physics_dt.
-        # Also, hold default posture for a short period after startup.
-        now = self.get_clock().now()
-        t = (now - self._t0).nanoseconds * 1e-9
-        if (not self._have_action) or (t < self.startup_hold_sec):
-            self._publish_targets(self._default_targets())
-        else:
-            self._publish_targets(self._last_targets)
 
     def _cb_action(self, msg: Float32MultiArray) -> None:
         act = np.asarray(msg.data, dtype=np.float32)
@@ -593,17 +615,13 @@ class {Robot}ActionsBridge(Node):
                 applied = np.array([self._action_to_target(act, i) for i in range(self.action_size)], dtype=np.float32)
                 self.get_logger().info(f"APPLIED ACTION: {applied}")
 
-        self._last_targets = self._compute_targets_from_action(act)
-        self._have_action = True
-
-        # If timer republish is disabled, publish directly from callback.
-        if not self.republish_from_timer:
-            now = self.get_clock().now()
-            t = (now - self._t0).nanoseconds * 1e-9
-            if t < self.startup_hold_sec:
-                self._publish_targets(self._default_targets())
-            else:
-                self._publish_targets(self._last_targets)
+        targets = self._compute_targets_from_action(act)
+        now = self.get_clock().now()
+        t = (now - self._t0).nanoseconds * 1e-9
+        if t < self.startup_hold_sec:
+            self._publish_targets(self._default_targets())
+        else:
+            self._publish_targets(targets)
 
 
 def main() -> None:
@@ -680,3 +698,4 @@ def main() -> None:
     out_dir = Path(args.out).resolve()
     pkg_dir = create_robot_pkg(robot, out_dir)
     print(f'Created: {pkg_dir}')
+
