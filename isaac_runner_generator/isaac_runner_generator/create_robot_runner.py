@@ -500,6 +500,8 @@ class {Robot}ActionsBridge(Node):
         if self.action_joint_names:
             self.get_logger().info('IO action joint order: ' + ', '.join(self.action_joint_names))
         self.action_size = int(((act0.get('shape') or [len(self.action_joint_names)])[0]) or len(self.action_joint_names))
+        self.action_full_path = str(act0.get('full_path') or '')
+        self.action_name = str(act0.get('name') or '')
         self.action_offsets = list(act0.get('offset') or [0.0] * self.action_size)
         scale_cfg = act0.get('scale', 1.0)
         if isinstance(scale_cfg, (int, float)):
@@ -509,13 +511,19 @@ class {Robot}ActionsBridge(Node):
         else:
             self.action_scale = 1.0
         self.action_clip = act0.get('clip', None)
+        alpha_cfg = act0.get('alpha', 1.0)
+        if isinstance(alpha_cfg, (int, float)):
+            self.action_alpha = float(alpha_cfg)
+        elif isinstance(alpha_cfg, (list, tuple)):
+            self.action_alpha = [float(x) for x in alpha_cfg]
+        else:
+            self.action_alpha = 1.0
 
-        # Note: We treat IO_descriptors.yaml 'offset' as part of the absolute joint target.
-        # Isaac Lab JointPositionAction semantics:
-        #   processed = raw * scale + offset
-        #   if clip is provided: clamp(processed)
-        # and the articulation receives this processed value as the position target (no extra default added).
-        self.get_logger().info('Action target formula: target = raw * scale + offset (no extra default_joint_pos added)')
+        self.is_joint_position_to_limits = (
+            'JointPositionToLimitsAction' in self.action_full_path
+            or 'EMAJointPositionToLimitsAction' in self.action_full_path
+        )
+        self.is_ema_to_limits = 'EMAJointPositionToLimitsAction' in self.action_full_path
 
         art = (self.io.get('articulations') or {}).get('robot') or {}
         self.articulation_joint_names = list(art.get('joint_names') or [])
@@ -527,6 +535,23 @@ class {Robot}ActionsBridge(Node):
             )
 
         self.default_pos_by_name = {n: float(p) for n, p in zip(self.articulation_joint_names, self.default_joint_pos)}
+
+        joint_limits = list(art.get('default_joint_pos_limits') or [])
+        self.default_joint_limits_by_name = {}
+        for n, lim in zip(self.articulation_joint_names, joint_limits):
+            if isinstance(lim, (list, tuple)) and len(lim) >= 2:
+                self.default_joint_limits_by_name[n] = (float(lim[0]), float(lim[1]))
+
+        if self.is_joint_position_to_limits:
+            self.get_logger().info(
+                'Action target formula: target = unscale(clamp(raw * scale, -1, 1), joint_limits)'
+            )
+            if self.is_ema_to_limits:
+                self.get_logger().info('EMA smoothing is enabled for action targets')
+        else:
+            self.get_logger().info(
+                'Action target formula: target = raw * scale + offset (no extra default_joint_pos added)'
+            )
 
         # Controller joint order is authoritative for /commands message layout.
         self.controller_joints = self._wait_for_controller_joints(
@@ -554,6 +579,10 @@ class {Robot}ActionsBridge(Node):
         self.pub = self.create_publisher(Float64MultiArray, '/joint_group_position_controller/commands', 10)
         self.sub = self.create_subscription(Float32MultiArray, '/policy/actions', self._cb_action, 10)
 
+        self._prev_targets_by_action_index = {}
+        for joint_name, act_i in self.action_index_by_name.items():
+            self._prev_targets_by_action_index[int(act_i)] = float(self.default_pos_by_name.get(joint_name, 0.0))
+
         self._t0 = self.get_clock().now()
 
     def _wait_for_controller_joints(self, node_name: str, param_name: str):
@@ -579,38 +608,47 @@ class {Robot}ActionsBridge(Node):
                 return joints
             self.get_logger().info('Controller joints list empty; retrying...')
 
+    def _clip_processed_action(self, processed: float, act_i: int) -> float:
+        if self.action_clip is None:
+            return processed
+
+        c = self.action_clip
+        try:
+            if isinstance(c, (list, tuple)) and act_i < len(c) and isinstance(c[act_i], (list, tuple)) and len(c[act_i]) >= 2:
+                cmin = float(c[act_i][0])
+                cmax = float(c[act_i][1])
+                return min(max(processed, cmin), cmax)
+            if isinstance(c, (list, tuple)) and len(c) >= 2 and not isinstance(c[0], (list, tuple)):
+                cmin = float(c[0])
+                cmax = float(c[1])
+                return min(max(processed, cmin), cmax)
+        except Exception:
+            pass
+        return processed
+
+    def _scale_value(self, cfg, act_i: int, default: float = 1.0) -> float:
+        if isinstance(cfg, (list, tuple)):
+            if act_i < len(cfg):
+                return float(cfg[act_i])
+            return float(default)
+        return float(cfg)
+
     def _action_to_target(self, act: np.ndarray, act_i: int) -> float:
-        # Isaac Lab JointAction:
-        #   processed = raw * scale + offset
-        #   if clip is provided: clamp(processed, min=clip[...,0], max=clip[...,1])
         a_raw = float(act[act_i])
-        scale = float(self.action_scale[act_i]) if isinstance(self.action_scale, (list, tuple)) and act_i < len(self.action_scale) else float(self.action_scale)
+        scale = self._scale_value(self.action_scale, act_i, 1.0)
         off = float(self.action_offsets[act_i]) if act_i < len(self.action_offsets) else 0.0
 
+        if self.is_joint_position_to_limits:
+            processed = self._clip_processed_action(a_raw * scale, act_i)
+            processed = min(max(processed, -1.0), 1.0)
+            joint_name = self.action_joint_names[act_i] if act_i < len(self.action_joint_names) else None
+            if joint_name is not None and joint_name in self.default_joint_limits_by_name:
+                lo, hi = self.default_joint_limits_by_name[joint_name]
+                processed = 0.5 * (processed + 1.0) * (hi - lo) + lo
+            return processed
+
         processed = a_raw * scale + off
-
-        # Respect exported clip (Isaac Lab exports per-joint [min,max] pairs).
-        if self.action_clip is not None:
-            c = self.action_clip
-            try:
-                if isinstance(c, (list, tuple)) and act_i < len(c) and isinstance(c[act_i], (list, tuple)) and len(c[act_i]) >= 2:
-                    cmin = float(c[act_i][0])
-                    cmax = float(c[act_i][1])
-                    if processed < cmin:
-                        processed = cmin
-                    elif processed > cmax:
-                        processed = cmax
-                elif isinstance(c, (list, tuple)) and len(c) >= 2 and not isinstance(c[0], (list, tuple)):
-                    # Fallback: global [min, max]
-                    cmin = float(c[0]); cmax = float(c[1])
-                    if processed < cmin:
-                        processed = cmin
-                    elif processed > cmax:
-                        processed = cmax
-            except Exception:
-                # If clip format is unexpected, ignore.
-                pass
-
+        processed = self._clip_processed_action(processed, act_i)
         return processed
 
     def _default_targets(self) -> list[float]:
@@ -624,7 +662,17 @@ class {Robot}ActionsBridge(Node):
         targets: list[float] = []
         for kind, idx, j in self.ctrl_rule:
             if kind == 'action':
-                targets.append(self._action_to_target(act, int(idx)))
+                target = self._action_to_target(act, int(idx))
+                if self.is_ema_to_limits:
+                    alpha = self._scale_value(self.action_alpha, int(idx), 1.0)
+                    alpha = min(max(alpha, 0.0), 1.0)
+                    prev = float(self._prev_targets_by_action_index.get(int(idx), self.default_pos_by_name.get(str(j), 0.0)))
+                    target = alpha * target + (1.0 - alpha) * prev
+                    lim = self.default_joint_limits_by_name.get(str(j))
+                    if lim is not None:
+                        target = min(max(target, float(lim[0])), float(lim[1]))
+                    self._prev_targets_by_action_index[int(idx)] = float(target)
+                targets.append(target)
             elif kind == 'default':
                 targets.append(float(self.default_pos_by_name.get(str(j), 0.0)))
             else:
