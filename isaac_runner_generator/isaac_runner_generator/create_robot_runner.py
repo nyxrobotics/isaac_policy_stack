@@ -113,7 +113,7 @@ def generate_launch_description():
             executable='isaac_policy_runner',
             name='isaac_policy_runner',
             output='screen',
-            parameters=[{'model_dir': model_dir, 'use_internal_action_observation': True}],
+            parameters=[{'model_dir': model_dir, 'use_internal_action_observation': True, 'debug_print': True, 'debug_every_n': 1}],
             remappings=REMAPS,
         ),
         Node(
@@ -136,6 +136,7 @@ def generate_launch_description():
 
 OBS_BRIDGE_TEMPLATE = r'''from __future__ import annotations
 
+import datetime
 import os
 import numpy as np
 import yaml
@@ -165,7 +166,7 @@ class {Robot}ObservationsBridge(Node):
         super().__init__('{robot}_observations_bridge_node')
 
         self.declare_parameter('model_dir', '')
-        self.declare_parameter('debug_print', False)
+        self.declare_parameter('debug_print', True)
         self.declare_parameter('debug_every_n', 1)
         self.declare_parameter('odom_twist_in_world_frame', False)
         self.debug_print = self.get_parameter('debug_print').get_parameter_value().bool_value
@@ -250,6 +251,8 @@ class {Robot}ObservationsBridge(Node):
         self.latest_joint_state = None
         self._warned_missing_inputs = False
         self._warned_missing_joints = False
+        self.input_topics_updated_ = False
+        self.have_received_input_topics_ = False
 
         self.timer = self.create_timer(self.publish_dt, self._on_timer_publish)
 
@@ -271,6 +274,10 @@ class {Robot}ObservationsBridge(Node):
             slices[name] = (cursor, size)
             cursor += size
         return slices
+
+    def _mark_input_topics_updated(self) -> None:
+        self.input_topics_updated_ = True
+        self.have_received_input_topics_ = True
 
     def _apply_overloads(self, term: str, vec: np.ndarray) -> np.ndarray:
         """Apply IO_descriptors.yaml observation overloads (scale/clip).
@@ -318,6 +325,7 @@ class {Robot}ObservationsBridge(Node):
         tw = msg.twist.twist
         self.base_lin_vel[:] = [tw.linear.x, tw.linear.y, tw.linear.z]
         self.have_odom = True
+        self._mark_input_topics_updated()
 
     def _cb_imu(self, msg: Imu) -> None:
         av = msg.angular_velocity
@@ -331,10 +339,12 @@ class {Robot}ObservationsBridge(Node):
         # Therefore, explicit normalization is unnecessary.
         self.projected_gravity[:] = (-R[:, 2])
         self.have_imu = True
+        self._mark_input_topics_updated()
 
     def _cb_cmd_vel(self, msg: Twist) -> None:
         self.generated_commands[:] = [msg.linear.x, msg.linear.y, msg.angular.z]
         self.have_cmd_vel = True
+        self._mark_input_topics_updated()
 
     def _cb_last_action(self, msg: Float32MultiArray) -> None:
         arr = np.asarray(msg.data, dtype=np.float32)
@@ -344,9 +354,16 @@ class {Robot}ObservationsBridge(Node):
     def _cb_joint_states(self, msg: JointState) -> None:
         self.latest_joint_state = msg
         self.have_joint_states = True
+        self._mark_input_topics_updated()
 
     def _on_timer_publish(self) -> None:
-        # Always publish on timer; use zeros/last values until inputs arrive.
+        if not self.have_received_input_topics_:
+            return
+
+        if not self.input_topics_updated_:
+            return
+
+        # Always publish on timer after any non-action input update; use zeros/last values until inputs arrive.
         if not self._warned_missing_inputs:
             missing_inputs = []
             if not self.have_odom:
@@ -404,9 +421,23 @@ class {Robot}ObservationsBridge(Node):
         put('joint_vel_rel', joint_vel_rel)
         put('last_action', self.last_action)
 
+        if self.debug_print:
+            self._debug_count += 1
+            if (self._debug_count % self.debug_every_n) == 0:
+                now = datetime.datetime.now().strftime("%H:%M:%S.%f")
+                self.get_logger().info(f'[{now}] [policy] observations: {obs}')
+                self.get_logger().info(f'  base_lin_vel: {self.base_lin_vel}')
+                self.get_logger().info(f'  base_ang_vel: {self.base_ang_vel}')
+                self.get_logger().info(f'  projected_gravity: {self.projected_gravity}')
+                self.get_logger().info(f'  generated_commands: {self.generated_commands}')
+                self.get_logger().info(f'  joint_pos_rel: {joint_pos_rel}')
+                self.get_logger().info(f'  joint_vel_rel: {joint_vel_rel}')
+                self.get_logger().info(f'  last_action: {self.last_action}')
+
         out = Float32MultiArray()
         out.data = obs.tolist()
         self.pub.publish(out)
+        self.input_topics_updated_ = False
 
 
 
@@ -441,7 +472,7 @@ class {Robot}ActionsBridge(Node):
 
         self.declare_parameter('model_dir', '')
         self.declare_parameter('startup_hold_sec', 1.0)
-        self.declare_parameter('debug_print', False)
+        self.declare_parameter('debug_print', True)
         self.declare_parameter('debug_every_n', 1)
         self.debug_print = self.get_parameter('debug_print').get_parameter_value().bool_value
         self.debug_every_n = int(self.get_parameter('debug_every_n').get_parameter_value().integer_value) or 1
