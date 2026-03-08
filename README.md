@@ -82,6 +82,13 @@ joint_group_position_controller:
 ## Notes
 
 - The policy runner is callback-driven (no internal control loop).
+- Generated observation bridge parameter `odom_twist_in_world_frame`:
+  - If `false` (default), `/odom.twist.twist.linear` is forwarded as-is to `base_lin_vel`.
+  - If `true`, the bridge interprets `/odom.twist.twist.linear` as world-frame linear velocity and rotates it into the body frame using the latest IMU orientation before publishing `base_lin_vel`.
+  - If `/odom` arrives before `/imu`, the bridge temporarily forwards the odom twist as-is and logs a warning once until IMU data becomes available.
 - Parameter `use_internal_action_observation`:
   - If `true`, the runner overwrites the `last_action` slice inside the incoming observation vector with the last action it published.
-  - In the generated observation bridge, `cmd_vel` and `last_action` are optional at startup; publication begins once required inputs (`odom`, `imu`, `joint_states`) are ready, and missing optional terms default to zeros until received.
+- Generated action bridge behavior:
+  - Raw policy actions are clamped to `[-1, 1]` before scaling.
+  - Final joint targets are clamped to `articulations.robot.default_joint_pos_limits` from `IO_descriptors.yaml` when limits are available.
+  - Exported action `clip` is still respected before the joint-limit clamp.

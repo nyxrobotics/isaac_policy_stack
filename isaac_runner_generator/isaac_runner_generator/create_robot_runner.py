@@ -231,46 +231,11 @@ class {Robot}ObservationsBridge(Node):
         if self.joint_pos_term is None or self.joint_vel_term is None:
             raise RuntimeError("IO_descriptors.yaml must contain joint_pos_rel and joint_vel_rel")
 
-        self.policy_joint_pos_names = list(self.joint_pos_term.get('joint_names') or [])
-        self.policy_joint_vel_names = list(self.joint_vel_term.get('joint_names') or self.policy_joint_pos_names)
-        self.policy_joint_names = list(self.policy_joint_pos_names)
-        if self.policy_joint_pos_names:
-            self.get_logger().info('IO observation joint_pos_rel order: ' + ', '.join(self.policy_joint_pos_names))
-        if self.policy_joint_vel_names:
-            self.get_logger().info('IO observation joint_vel_rel order: ' + ', '.join(self.policy_joint_vel_names))
-
-        # Prefer per-term offsets from observation descriptors. If they are missing,
-        # fall back to articulation defaults matched by joint name.
-        art = ((self.io.get('articulations') or {}).get('robot') or {})
-        art_joint_names = list(art.get('joint_names') or [])
-        art_default_joint_pos = list(art.get('default_joint_pos') or [])
-        art_default_joint_vel = list(art.get('default_joint_vel') or [])
-        self.art_default_joint_pos_by_name = {
-            name: float(art_default_joint_pos[i])
-            for i, name in enumerate(art_joint_names)
-            if i < len(art_default_joint_pos)
-        }
-        self.art_default_joint_vel_by_name = {
-            name: float(art_default_joint_vel[i])
-            for i, name in enumerate(art_joint_names)
-            if i < len(art_default_joint_vel)
-        }
-
-        term_pos_offsets = list(self.joint_pos_term.get('joint_pos_offsets') or [])
-        term_vel_offsets = list(self.joint_vel_term.get('joint_vel_offsets') or [])
-        self.policy_joint_pos_offset_by_name = {}
-        for i, jname in enumerate(self.policy_joint_pos_names):
-            if i < len(term_pos_offsets) and term_pos_offsets[i] is not None:
-                self.policy_joint_pos_offset_by_name[jname] = float(term_pos_offsets[i])
-            else:
-                self.policy_joint_pos_offset_by_name[jname] = float(self.art_default_joint_pos_by_name.get(jname, 0.0))
-
-        self.policy_joint_vel_offset_by_name = {}
-        for i, jname in enumerate(self.policy_joint_vel_names):
-            if i < len(term_vel_offsets) and term_vel_offsets[i] is not None:
-                self.policy_joint_vel_offset_by_name[jname] = float(term_vel_offsets[i])
-            else:
-                self.policy_joint_vel_offset_by_name[jname] = float(self.art_default_joint_vel_by_name.get(jname, 0.0))
+        self.policy_joint_names = list(self.joint_pos_term.get('joint_names') or [])
+        if self.policy_joint_names:
+            self.get_logger().info('IO observation joint_pos_rel order: ' + ', '.join(self.policy_joint_names))
+        self.policy_joint_pos_offsets = list(self.joint_pos_term.get('joint_pos_offsets') or [])
+        self.policy_joint_vel_offsets = list(self.joint_vel_term.get('joint_vel_offsets') or [0.0]*len(self.policy_joint_names))
 
         self.pub = self.create_publisher(Float32MultiArray, '/policy/observations', 10)
 
@@ -282,12 +247,13 @@ class {Robot}ObservationsBridge(Node):
         self.have_odom = False
         self.have_imu = False
         self.have_cmd_vel = False
+        self._warned_odom_world_without_imu = False
         self.have_joint_states = False
         self.latest_joint_state = None
         self._warned_missing_inputs = False
         self._warned_missing_joints = False
         self.input_topics_updated_ = False
-        self.input_topics_received_ = False
+        self.have_received_input_topics_ = False
 
         self.timer = self.create_timer(self.publish_dt, self._on_timer_publish)
 
@@ -312,11 +278,7 @@ class {Robot}ObservationsBridge(Node):
 
     def _mark_input_topics_updated(self) -> None:
         self.input_topics_updated_ = True
-        # Required inputs for observation publication. Optional terms like
-        # cmd_vel / last_action should default to zeros until they arrive.
-        self.input_topics_received_ = bool(
-            self.have_odom and self.have_imu and self.have_joint_states
-        )
+        self.have_received_input_topics_ = True
 
     def _apply_overloads(self, term: str, vec: np.ndarray) -> np.ndarray:
         """Apply IO_descriptors.yaml observation overloads (scale/clip).
@@ -360,9 +322,27 @@ class {Robot}ObservationsBridge(Node):
                         out = np.minimum(np.maximum(out, lo), hi)
         return out
 
+    def _update_base_lin_vel_from_odom(self) -> None:
+        if not self.odom_twist_in_world_frame:
+            self.base_lin_vel[:] = self.odom_linear
+            return
+
+        if not self.have_imu:
+            self.base_lin_vel[:] = self.odom_linear
+            if not self._warned_odom_world_without_imu:
+                self.get_logger().warning(
+                    'odom_twist_in_world_frame=True but IMU orientation has not arrived yet; '
+                    'publishing odom twist as-is until IMU is available'
+                )
+                self._warned_odom_world_without_imu = True
+            return
+
+        self.base_lin_vel[:] = self.rotation_body_to_world.T @ self.odom_linear
+
     def _cb_odom(self, msg: Odometry) -> None:
         tw = msg.twist.twist
-        self.base_lin_vel[:] = [tw.linear.x, tw.linear.y, tw.linear.z]
+        self.odom_linear[:] = [tw.linear.x, tw.linear.y, tw.linear.z]
+        self._update_base_lin_vel_from_odom()
         self.have_odom = True
         self._mark_input_topics_updated()
 
@@ -372,12 +352,15 @@ class {Robot}ObservationsBridge(Node):
 
         q = msg.orientation
         R = quat_to_rotmat(q.x, q.y, q.z, q.w)
+        self.rotation_body_to_world[:] = R
 
         # NOTE: adjust if your IMU frame differs
         # R is a rotation matrix, so R @ [0, 0, -1] is guaranteed to have norm 1.
         # Therefore, explicit normalization is unnecessary.
         self.projected_gravity[:] = (-R[:, 2])
         self.have_imu = True
+        if self.have_odom and self.odom_twist_in_world_frame:
+            self._update_base_lin_vel_from_odom()
         self._mark_input_topics_updated()
 
     def _cb_cmd_vel(self, msg: Twist) -> None:
@@ -395,80 +378,48 @@ class {Robot}ObservationsBridge(Node):
         self.have_joint_states = True
         self._mark_input_topics_updated()
 
-    def _canonical_joint_name(self, name: str) -> str:
-        if not name:
-            return ''
-        out = str(name).strip()
-        if '/' in out:
-            out = out.split('/')[-1]
-        return out
-
-    def _build_joint_state_lookup(self, msg: JointState) -> dict[str, int]:
-        lookup = {}
-        for i, name in enumerate(msg.name):
-            lookup.setdefault(name, i)
-            canonical = self._canonical_joint_name(name)
-            lookup.setdefault(canonical, i)
-        return lookup
-
     def _on_timer_publish(self) -> None:
-        if not self.input_topics_received_:
-            if not self._warned_missing_inputs:
-                missing_inputs = []
-                if not self.have_odom:
-                    missing_inputs.append('odom')
-                if not self.have_imu:
-                    missing_inputs.append('imu')
-                if not self.have_joint_states:
-                    missing_inputs.append('joint_states')
-                if missing_inputs:
-                    self.get_logger().warning(
-                        'Waiting for required inputs: ' + ', '.join(missing_inputs)
-                    )
-                self._warned_missing_inputs = True
+        if not self.have_received_input_topics_:
             return
 
         if not self.input_topics_updated_:
             return
 
-        # Publish once required inputs are ready. Optional terms such as
-        # cmd_vel / last_action stay at zeros until they arrive.
-        if self._warned_missing_inputs and (self.have_odom and self.have_imu and self.have_joint_states):
-            self.get_logger().info('Required inputs ready. Starting observation publication; optional inputs default to zeros until received.')
-            self._warned_missing_inputs = False
+        # Always publish on timer after any non-action input update; use zeros/last values until inputs arrive.
+        if not self._warned_missing_inputs:
+            missing_inputs = []
+            if not self.have_odom:
+                missing_inputs.append('odom')
+            if not self.have_imu:
+                missing_inputs.append('imu')
+            if not self.have_cmd_vel:
+                missing_inputs.append('cmd_vel')
+            if not self.have_joint_states:
+                missing_inputs.append('joint_states')
+            if missing_inputs:
+                self.get_logger().warning(
+                    'Missing inputs: ' + ', '.join(missing_inputs) + ' (publishing zeros/last values)'
+                )
+            self._warned_missing_inputs = True
 
         msg = self.latest_joint_state
-        name_to_idx = self._build_joint_state_lookup(msg) if msg is not None else {}
+        name_to_idx = {n: i for i, n in enumerate(msg.name)} if msg is not None else {}
 
-        joint_pos_rel = np.zeros((len(self.policy_joint_pos_names),), dtype=np.float32)
-        joint_vel_rel = np.zeros((len(self.policy_joint_vel_names),), dtype=np.float32)
-
-        missing_pos = []
-        for k, jname in enumerate(self.policy_joint_pos_names):
-            lookup_name = jname if jname in name_to_idx else self._canonical_joint_name(jname)
-            if lookup_name not in name_to_idx:
-                missing_pos.append(jname)
-                continue
-            i = name_to_idx[lookup_name]
-            pos = float(msg.position[i]) if i < len(msg.position) else 0.0
-            pos0 = float(self.policy_joint_pos_offset_by_name.get(jname, self.art_default_joint_pos_by_name.get(jname, 0.0)))
-            joint_pos_rel[k] = pos - pos0
-
-        missing_vel = []
-        for k, jname in enumerate(self.policy_joint_vel_names):
-            lookup_name = jname if jname in name_to_idx else self._canonical_joint_name(jname)
-            if lookup_name not in name_to_idx:
-                missing_vel.append(jname)
-                continue
-            i = name_to_idx[lookup_name]
-            vel = float(msg.velocity[i]) if i < len(msg.velocity) else 0.0
-            vel0 = float(self.policy_joint_vel_offset_by_name.get(jname, self.art_default_joint_vel_by_name.get(jname, 0.0)))
-            joint_vel_rel[k] = vel - vel0
+        joint_pos_rel = np.zeros((len(self.policy_joint_names),), dtype=np.float32)
+        joint_vel_rel = np.zeros((len(self.policy_joint_names),), dtype=np.float32)
 
         missing = []
-        for name in missing_pos + missing_vel:
-            if name not in missing:
-                missing.append(name)
+        for k, jname in enumerate(self.policy_joint_names):
+            if jname not in name_to_idx:
+                missing.append(jname)
+                continue
+            i = name_to_idx[jname]
+            pos = float(msg.position[i]) if i < len(msg.position) else 0.0
+            vel = float(msg.velocity[i]) if i < len(msg.velocity) else 0.0
+            pos0 = float(self.policy_joint_pos_offsets[k]) if k < len(self.policy_joint_pos_offsets) else 0.0
+            vel0 = float(self.policy_joint_vel_offsets[k]) if k < len(self.policy_joint_vel_offsets) else 0.0
+            joint_pos_rel[k] = pos - pos0
+            joint_vel_rel[k] = vel - vel0
 
         if missing and not self._warned_missing_joints:
             self.get_logger().warning('Missing joints in /joint_states: ' + ', '.join(missing))
@@ -571,8 +522,6 @@ class {Robot}ActionsBridge(Node):
         if self.action_joint_names:
             self.get_logger().info('IO action joint order: ' + ', '.join(self.action_joint_names))
         self.action_size = int(((act0.get('shape') or [len(self.action_joint_names)])[0]) or len(self.action_joint_names))
-        self.action_full_path = str(act0.get('full_path') or '')
-        self.action_name = str(act0.get('name') or '')
         self.action_offsets = list(act0.get('offset') or [0.0] * self.action_size)
         scale_cfg = act0.get('scale', 1.0)
         if isinstance(scale_cfg, (int, float)):
@@ -582,21 +531,19 @@ class {Robot}ActionsBridge(Node):
         else:
             self.action_scale = 1.0
         self.action_clip = act0.get('clip', None)
-        alpha_cfg = act0.get('alpha', 1.0)
-        if isinstance(alpha_cfg, (int, float)):
-            self.action_alpha = float(alpha_cfg)
-        elif isinstance(alpha_cfg, (list, tuple)):
-            self.action_alpha = [float(x) for x in alpha_cfg]
-        else:
-            self.action_alpha = 1.0
-
-        self.is_joint_position_to_limits = (
-            'JointPositionToLimitsAction' in self.action_full_path
-            or 'EMAJointPositionToLimitsAction' in self.action_full_path
-        )
-        self.is_ema_to_limits = 'EMAJointPositionToLimitsAction' in self.action_full_path
 
         art = (self.io.get('articulations') or {}).get('robot') or {}
+        self.default_joint_pos_limits = art.get('default_joint_pos_limits', {}) or {}
+
+        # Note: For ROS replay safety we clamp twice:
+        #   1) raw policy output to [-1, 1]
+        #   2) final target = raw_clamped * scale + offset to default_joint_pos_limits when available
+        # We still respect exported action clip if provided.
+        self.get_logger().info(
+            'Action target formula: raw_clamped = clamp(raw, -1, 1); '
+            'target = clamp(raw_clamped * scale + offset, default_joint_pos_limits when available)'
+        )
+
         self.articulation_joint_names = list(art.get('joint_names') or [])
         self.default_joint_pos = list(art.get('default_joint_pos') or [])
         if len(self.articulation_joint_names) != len(self.default_joint_pos):
@@ -606,23 +553,21 @@ class {Robot}ActionsBridge(Node):
             )
 
         self.default_pos_by_name = {n: float(p) for n, p in zip(self.articulation_joint_names, self.default_joint_pos)}
-
-        joint_limits = list(art.get('default_joint_pos_limits') or [])
-        self.default_joint_limits_by_name = {}
-        for n, lim in zip(self.articulation_joint_names, joint_limits):
-            if isinstance(lim, (list, tuple)) and len(lim) >= 2:
-                self.default_joint_limits_by_name[n] = (float(lim[0]), float(lim[1]))
-
-        if self.is_joint_position_to_limits:
-            self.get_logger().info(
-                'Action target formula: target = unscale(clamp(raw * scale, -1, 1), joint_limits)'
-            )
-            if self.is_ema_to_limits:
-                self.get_logger().info('EMA smoothing is enabled for action targets')
-        else:
-            self.get_logger().info(
-                'Action target formula: target = raw * scale + offset (no extra default_joint_pos added)'
-            )
+        self.default_limits_by_name = {}
+        if isinstance(self.default_joint_pos_limits, dict):
+            for jn, lim in self.default_joint_pos_limits.items():
+                try:
+                    if isinstance(lim, (list, tuple)) and len(lim) >= 2:
+                        self.default_limits_by_name[str(jn)] = (float(lim[0]), float(lim[1]))
+                except Exception:
+                    pass
+        elif isinstance(self.default_joint_pos_limits, (list, tuple)):
+            for jn, lim in zip(self.articulation_joint_names, self.default_joint_pos_limits):
+                try:
+                    if isinstance(lim, (list, tuple)) and len(lim) >= 2:
+                        self.default_limits_by_name[str(jn)] = (float(lim[0]), float(lim[1]))
+                except Exception:
+                    pass
 
         # Controller joint order is authoritative for /commands message layout.
         self.controller_joints = self._wait_for_controller_joints(
@@ -650,10 +595,6 @@ class {Robot}ActionsBridge(Node):
         self.pub = self.create_publisher(Float64MultiArray, '/joint_group_position_controller/commands', 10)
         self.sub = self.create_subscription(Float32MultiArray, '/policy/actions', self._cb_action, 10)
 
-        self._prev_targets_by_action_index = {}
-        for joint_name, act_i in self.action_index_by_name.items():
-            self._prev_targets_by_action_index[int(act_i)] = float(self.default_pos_by_name.get(joint_name, 0.0))
-
         self._t0 = self.get_clock().now()
 
     def _wait_for_controller_joints(self, node_name: str, param_name: str):
@@ -679,81 +620,53 @@ class {Robot}ActionsBridge(Node):
                 return joints
             self.get_logger().info('Controller joints list empty; retrying...')
 
-    def _clip_processed_action(self, processed: float, act_i: int) -> float:
-        if self.action_clip is None:
-            return processed
-
-        c = self.action_clip
-        try:
-            if isinstance(c, (int, float)):
-                bound = abs(float(c))
-                return min(max(processed, -bound), bound)
-            if isinstance(c, (list, tuple)) and act_i < len(c) and isinstance(c[act_i], (list, tuple)) and len(c[act_i]) >= 2:
-                cmin = float(c[act_i][0])
-                cmax = float(c[act_i][1])
-                return min(max(processed, cmin), cmax)
-            if isinstance(c, (list, tuple)) and len(c) >= 2 and not isinstance(c[0], (list, tuple)):
-                cmin = float(c[0])
-                cmax = float(c[1])
-                return min(max(processed, cmin), cmax)
-        except Exception:
-            pass
-        return processed
-
-    def _scale_value(self, cfg, act_i: int, default: float = 1.0) -> float:
-        if isinstance(cfg, (list, tuple)):
-            if act_i < len(cfg):
-                return float(cfg[act_i])
-            return float(default)
-        return float(cfg)
-
-    def _offset_value(self, act_i: int, default: float = 0.0) -> float:
-        if isinstance(self.action_offsets, (list, tuple)):
-            if act_i < len(self.action_offsets):
-                return float(self.action_offsets[act_i])
-            return float(default)
-        return float(self.action_offsets)
-
-    def _compute_action_pipeline(self, act: np.ndarray, act_i: int) -> dict:
+    def _action_to_target(self, act: np.ndarray, act_i: int, joint_name: str | None = None) -> float:
+        # ROS replay safety behavior:
+        #   raw_clamped = clamp(raw, -1, 1)
+        #   processed = raw_clamped * scale + offset
+        #   if clip is provided: clamp(processed, min=clip[...,0], max=clip[...,1])
+        #   if default_joint_pos_limits exist for the joint: clamp(processed, lo, hi)
         a_raw = float(act[act_i])
-        scale = self._scale_value(self.action_scale, act_i, 1.0)
-        offset = self._offset_value(act_i, 0.0)
-        scaled = a_raw * scale
+        a_raw = max(-1.0, min(1.0, a_raw))
+        scale = float(self.action_scale[act_i]) if isinstance(self.action_scale, (list, tuple)) and act_i < len(self.action_scale) else float(self.action_scale)
+        off = float(self.action_offsets[act_i]) if act_i < len(self.action_offsets) else 0.0
 
-        out = {
-            'raw': a_raw,
-            'scale': scale,
-            'offset': offset,
-            'scaled': scaled,
-            'offset_applied': scaled,
-            'clipped': scaled,
-            'normalized': scaled,
-            'target_pre_ema': scaled,
-        }
+        processed = a_raw * scale + off
 
-        if self.is_joint_position_to_limits:
-            clipped = self._clip_processed_action(scaled, act_i)
-            normalized = min(max(clipped, -1.0), 1.0)
-            target = normalized
-            joint_name = self.action_joint_names[act_i] if act_i < len(self.action_joint_names) else None
-            if joint_name is not None and joint_name in self.default_joint_limits_by_name:
-                lo, hi = self.default_joint_limits_by_name[joint_name]
-                target = 0.5 * (normalized + 1.0) * (hi - lo) + lo
-            out['clipped'] = clipped
-            out['normalized'] = normalized
-            out['target_pre_ema'] = target
-            return out
+        # Respect exported clip (Isaac Lab exports per-joint [min,max] pairs).
+        if self.action_clip is not None:
+            c = self.action_clip
+            try:
+                if isinstance(c, (list, tuple)) and act_i < len(c) and isinstance(c[act_i], (list, tuple)) and len(c[act_i]) >= 2:
+                    cmin = float(c[act_i][0])
+                    cmax = float(c[act_i][1])
+                    if processed < cmin:
+                        processed = cmin
+                    elif processed > cmax:
+                        processed = cmax
+                elif isinstance(c, (list, tuple)) and len(c) >= 2 and not isinstance(c[0], (list, tuple)):
+                    # Fallback: global [min, max]
+                    cmin = float(c[0]); cmax = float(c[1])
+                    if processed < cmin:
+                        processed = cmin
+                    elif processed > cmax:
+                        processed = cmax
+            except Exception:
+                # If clip format is unexpected, ignore.
+                pass
 
-        offset_applied = scaled + offset
-        clipped = self._clip_processed_action(offset_applied, act_i)
-        out['offset_applied'] = offset_applied
-        out['clipped'] = clipped
-        out['normalized'] = clipped
-        out['target_pre_ema'] = clipped
-        return out
+        if joint_name is None and act_i < len(self.action_joint_names):
+            joint_name = str(self.action_joint_names[act_i])
+        if joint_name is not None:
+            lim = self.default_limits_by_name.get(str(joint_name))
+            if lim is not None:
+                lo, hi = lim
+                if processed < lo:
+                    processed = lo
+                elif processed > hi:
+                    processed = hi
 
-    def _action_to_target(self, act: np.ndarray, act_i: int) -> float:
-        return float(self._compute_action_pipeline(act, act_i)['target_pre_ema'])
+        return processed
 
     def _default_targets(self) -> list[float]:
         # Default command for ALL controller joints.
@@ -766,17 +679,7 @@ class {Robot}ActionsBridge(Node):
         targets: list[float] = []
         for kind, idx, j in self.ctrl_rule:
             if kind == 'action':
-                target = self._action_to_target(act, int(idx))
-                if self.is_ema_to_limits:
-                    alpha = self._scale_value(self.action_alpha, int(idx), 1.0)
-                    alpha = min(max(alpha, 0.0), 1.0)
-                    prev = float(self._prev_targets_by_action_index.get(int(idx), self.default_pos_by_name.get(str(j), 0.0)))
-                    target = alpha * target + (1.0 - alpha) * prev
-                    lim = self.default_joint_limits_by_name.get(str(j))
-                    if lim is not None:
-                        target = min(max(target, float(lim[0])), float(lim[1]))
-                    self._prev_targets_by_action_index[int(idx)] = float(target)
-                targets.append(target)
+                targets.append(self._action_to_target(act, int(idx), joint_name=str(j)))
             elif kind == 'default':
                 targets.append(float(self.default_pos_by_name.get(str(j), 0.0)))
             else:
@@ -800,17 +703,11 @@ class {Robot}ActionsBridge(Node):
             self._debug_count += 1
             if (self._debug_count % self.debug_every_n) == 0:
                 self.get_logger().info(f"[policy] actions: {act}")
-                pipelines = [self._compute_action_pipeline(act, i) for i in range(self.action_size)]
-                target_pre_ema = np.array([p['target_pre_ema'] for p in pipelines], dtype=np.float32)
-                self.get_logger().info(f"target_pre_ema: {target_pre_ema}")
-                for i, p in enumerate(pipelines):
-                    joint_name = self.action_joint_names[i] if i < len(self.action_joint_names) else f'joint_{i}'
-                    self.get_logger().info(
-                        f"  {joint_name}: raw={p['raw']:.6f}, scale={p['scale']:.6f}, offset={p['offset']:.6f}, "
-                        f"scaled={p['scaled']:.6f}, offset_applied={p['offset_applied']:.6f}, "
-                        f"clipped={p['clipped']:.6f}, normalized={p['normalized']:.6f}, "
-                        f"target_pre_ema={p['target_pre_ema']:.6f}"
-                    )
+                applied = np.array([
+                    self._action_to_target(act, i, joint_name=str(self.action_joint_names[i]) if i < len(self.action_joint_names) else None)
+                    for i in range(self.action_size)
+                ], dtype=np.float32)
+                self.get_logger().info(f"APPLIED ACTION: {applied}")
 
         targets = self._compute_targets_from_action(act)
         now = self.get_clock().now()
