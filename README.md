@@ -84,3 +84,4 @@ joint_group_position_controller:
 - The policy runner is callback-driven (no internal control loop).
 - Parameter `use_internal_action_observation`:
   - If `true`, the runner overwrites the `last_action` slice inside the incoming observation vector with the last action it published.
+  - In the generated observation bridge, `cmd_vel` and `last_action` are optional at startup; publication begins once required inputs (`odom`, `imu`, `joint_states`) are ready, and missing optional terms default to zeros until received.
